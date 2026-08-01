@@ -1,0 +1,28 @@
+# =============================================================================
+# Local Config: ai-platform-db.yaml (数据库 + 中间件连接)
+# =============================================================================
+# 复制此文件为 ai-platform-db.yaml 并填入真实值
+# 部署时通过环境变量或平台 Secret 注入，不要提交真实配置到 Git
+# =============================================================================
+
+# PostgreSQL
+database_url: postgresql+asyncpg://postgres:postgres@localhost:5432/ai_platform
+database_pool_size: 10
+database_max_overflow: 5
+
+# Redis
+redis_url: redis://localhost:6379/0
+redis_password: ""
+
+# Milvus 向量数据库
+milvus_uri: http://localhost:19530
+milvus_token: ""
+
+# Elasticsearch
+elasticsearch_url: http://localhost:9200
+
+# MinIO 对象存储
+minio_endpoint: localhost:9000
+minio_access_key: minioadmin
+minio_secret_key: minioadmin
+minio_bucket: ai-platform

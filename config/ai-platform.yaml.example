@@ -1,0 +1,29 @@
+# =============================================================================
+# Local Config: ai-platform.yaml
+# =============================================================================
+# Nacos 不可用时的本地降级配置。
+# 将此目录(config/)下的 YAML 文件作为 Nacos 配置的本地镜像。
+# 修改后重启服务即可生效。
+# =============================================================================
+
+app_name: ai-platform
+app_env: development
+app_debug: true
+app_host: 0.0.0.0
+app_port: 8000
+app_log_level: DEBUG
+
+# 加密密钥 — 生产环境请替换为随机生成的值
+app_secret_key: change-me-in-production-use-a-random-64-char-string
+
+# LiteLLM AI Gateway
+litellm_api_base: http://localhost:4000
+litellm_master_key: sk-litellm-master-key
+
+# Embedding
+embedding_model: text-embedding-3-small
+embedding_dimensions: 1536
+
+# 限流
+rate_limit_default: 1000
+rate_limit_window_seconds: 60

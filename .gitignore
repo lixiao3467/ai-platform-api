@@ -1,0 +1,40 @@
+# Dependencies
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Config with secrets
+config/ai-platform-db.yaml
+config/ai-platform-auth.yaml
+config/ai-platform.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

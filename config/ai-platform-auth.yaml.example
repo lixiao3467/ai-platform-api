@@ -1,0 +1,15 @@
+# =============================================================================
+# Local Config: ai-platform-auth.yaml (认证 + 可观测性)
+# =============================================================================
+# 复制此文件为 ai-platform-auth.yaml 并填入真实值
+# =============================================================================
+
+# JWT
+jwt_secret_key: change-me-in-production-use-random-string
+jwt_algorithm: HS256
+jwt_expire_minutes: 1440
+
+# Langfuse (留空 = 不启用)
+langfuse_public_key: ""
+langfuse_secret_key: ""
+langfuse_host: http://localhost:3000
