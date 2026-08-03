@@ -46,6 +46,7 @@ dependencies = [
     # Observability
     "structlog>=24.4.0",
     "langfuse>=2.0.0",
+    "prometheus-client>=0.21.0",
     # Utilities
     "orjson>=3.10.0",
     "tenacity>=9.0.0",
