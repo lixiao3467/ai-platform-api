@@ -2,7 +2,7 @@
 name = "ai-platform"
 version = "0.1.0"
 description = "Enterprise AI Middle Platform — Unified AI capabilities for enterprise applications"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "AI Platform Team" }]
 
