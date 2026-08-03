@@ -100,9 +100,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # --- Startup: initialize lazy singletons (fast, no blocking checks) ---
     # Deep health checks happen in /health endpoint, not here.
     # This lets the app accept traffic immediately so Railway/infra healthchecks pass.
+    from ai_platform.infra.cache.redis_client import get_redis
     from ai_platform.infra.database.connection import init_db
 
     await init_db()  # creates engine — no blocking connection test
+    # Pre-warm Redis so first request doesn't trigger a slow lazy connect
+    try:
+        await get_redis()
+    except Exception as e:
+        logger.warning("Redis pre-warm failed (will retry on first use)", error=str(e))
 
     yield
 

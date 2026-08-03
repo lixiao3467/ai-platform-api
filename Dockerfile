@@ -45,8 +45,8 @@ ENV PYTHONUNBUFFERED=1
 USER appuser
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import httpx; httpx.get('http://localhost:8000/live').raise_for_status()"
 
 # Expose port
 EXPOSE 8000
