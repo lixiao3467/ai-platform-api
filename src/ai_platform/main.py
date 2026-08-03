@@ -97,17 +97,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         version=app.version,
     )
 
-    # --- Startup ---
-    from ai_platform.infra.cache.redis_client import get_redis
+    # --- Startup: initialize lazy singletons (fast, no blocking checks) ---
+    # Deep health checks happen in /health endpoint, not here.
+    # This lets the app accept traffic immediately so Railway/infra healthchecks pass.
     from ai_platform.infra.database.connection import init_db
-    from ai_platform.observability.startup import validate_startup
 
-    await init_db()
-    await get_redis()
-
-    # Validate all critical dependencies before accepting traffic
-    startup_results = await validate_startup()
-    logger.info("Startup validation complete", results=startup_results)
+    await init_db()  # creates engine — no blocking connection test
 
     yield
 
@@ -203,8 +198,13 @@ def create_app() -> FastAPI:
         structlog.contextvars.clear_contextvars()
         return response
 
-    # --- Health check (deep) ---
-    @app.get("/health", tags=["system"])
+    # --- Liveness probe — instant 200 for infrastructure healthchecks ---
+    @app.get("/live", tags=["system"], response_model=None)
+    async def liveness():
+        return {"status": "ok", "service": settings.app_name, "version": app.version}
+
+    # --- Readiness / deep health check (may be slow) ---
+    @app.get("/health", tags=["system"], response_model=None)
     async def health() -> dict:
         from ai_platform.observability.startup import deep_health_check
 

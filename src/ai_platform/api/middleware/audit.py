@@ -17,6 +17,7 @@ logger = structlog.get_logger()
 
 # Paths that should not be audited (health checks, docs, metrics)
 _AUDIT_SKIP_PATHS = frozenset({
+    "/live",
     "/health",
     "/docs",
     "/redoc",
