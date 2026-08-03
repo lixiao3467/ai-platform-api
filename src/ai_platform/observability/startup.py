@@ -34,18 +34,18 @@ async def validate_startup() -> dict[str, bool]:
 
     # Log results
     for component, healthy in results.items():
-        status = "✓" if healthy else "✗"
-        logger.info(f"Startup check: {status} {component}")
+        status = "OK" if healthy else "WARN"
+        logger.info(f"Startup check: [{status}] {component}")
 
-    # Critical dependencies that MUST be healthy
-    critical = ["postgresql", "redis", "config"]
-    failed = [c for c in critical if not results.get(c, False)]
-
+    # Report failed dependencies but DO NOT block startup.
+    # In production, the health check endpoint (/health) will report degraded status.
+    # This allows the app to start even when some dependencies are temporarily unavailable.
+    failed = [c for c in results if not results[c]]
     if failed:
-        raise StartupError(
-            f"Startup validation failed. "
-            f"Critical dependencies unreachable: {', '.join(failed)}. "
-            f"Refusing to start — fix dependencies and retry."
+        logger.warning(
+            "Some dependencies are unreachable at startup. "
+            "App will start in degraded mode. Fix and redeploy.",
+            failed=failed,
         )
 
     return results
@@ -99,9 +99,7 @@ def _check_config() -> bool:
     if issues:
         for issue in issues:
             logger.warning(f"Config warning: {issue}")
-        # In production, config issues are fatal
-        if settings.is_production:
-            return False
+        # Log warnings but don't block startup — /health will report degraded
 
     return True
 

@@ -13,6 +13,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
+from starlette.responses import Response
 
 from ai_platform.config import get_settings
 
@@ -221,8 +222,8 @@ def create_app() -> FastAPI:
         }
 
     # --- Prometheus metrics endpoint ---
-    @app.get("/metrics", tags=["system"])
-    async def metrics() -> Response:
+    @app.get("/metrics", tags=["system"], response_class=Response, response_model=None)
+    async def metrics():
         from ai_platform.observability.metrics import get_metrics
 
         return Response(

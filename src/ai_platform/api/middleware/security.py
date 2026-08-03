@@ -40,7 +40,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             response.headers["Pragma"] = "no-cache"
 
         # Hide server information
-        response.headers.pop("Server", None)
-        response.headers.pop("X-Powered-By", None)
+        for header in ("Server", "X-Powered-By"):
+            if header in response.headers:
+                del response.headers[header]
 
         return response
