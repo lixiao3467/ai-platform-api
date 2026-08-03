@@ -23,8 +23,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         settings = get_settings()
 
-        # Skip rate limiting for health checks
-        if request.url.path in ("/health", "/docs", "/redoc", "/openapi.json"):
+        # Skip rate limiting for health checks and public endpoints
+        if request.url.path in (
+            "/live", "/health", "/docs", "/redoc",
+            "/openapi.json", "/metrics", "/favicon.ico",
+        ):
             return await call_next(request)
 
         # Determine rate limit key
