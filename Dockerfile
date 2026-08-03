@@ -52,4 +52,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 EXPOSE 8000
 
 # Run the application
-CMD ["uvicorn", "ai_platform.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["python", "-m", "uvicorn", "ai_platform.main:app", "--host", "0.0.0.0", "--port", "8000"]
