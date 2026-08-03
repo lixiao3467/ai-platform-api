@@ -29,14 +29,14 @@ class PromptCreateRequest(BaseModel):
     content: str = Field(description="Jinja2 template content")
     description: str | None = None
     variables: list[dict] | None = None
-    model_config: dict | None = None
+    llm_config: dict | None = None
 
 
 class PromptVersionRequest(BaseModel):
     content: str
     change_note: str | None = None
     variables: list[dict] | None = None
-    model_config: dict | None = None
+    llm_config: dict | None = None
 
 
 class PromptRenderRequest(BaseModel):
@@ -87,7 +87,7 @@ async def create_prompt(
             content=req.content,
             description=req.description,
             variables=req.variables,
-            model_config=req.model_config,
+            model_config=req.llm_config,
             app_id=ctx.app_id,
         )
     except ValueError as e:
@@ -149,7 +149,7 @@ async def create_version(
             prompt_id, req.content,
             change_note=req.change_note,
             variables=req.variables,
-            model_config=req.model_config,
+            model_config=req.llm_config,
             created_by=ctx.user_id,
         )
     except ValueError as e:
