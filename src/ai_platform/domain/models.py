@@ -319,7 +319,7 @@ class Workflow(Base):
 
 class WorkflowExecution(Base):
     __tablename__ = "workflow_executions"
-    __table_args__ = (Index("idx_wf_exec_status", "status", "created_at"),)
+    __table_args__ = (Index("idx_wf_exec_status", "status", "started_at"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     workflow_id: Mapped[uuid.UUID] = mapped_column(
