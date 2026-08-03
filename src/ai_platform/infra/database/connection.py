@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -18,17 +19,46 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
+def _normalize_database_url(url: str) -> tuple[str, dict]:
+    """
+    Normalize DATABASE_URL for asyncpg compatibility.
+
+    asyncpg uses `ssl=require|prefer|allow|disable` instead of psycopg2's
+    `sslmode=require`. Also returns connect_args for explicit SSL control.
+    """
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    connect_args: dict = {}
+
+    # Convert sslmode (psycopg2) to ssl (asyncpg)
+    if "sslmode" in query and "ssl" not in query:
+        sslmode = query.pop("sslmode")[0]
+        # Map psycopg2 sslmode values to asyncpg ssl values
+        ssl_map = {"require": "require", "prefer": "prefer", "allow": "prefer",
+                    "disable": "disable", "verify-ca": "require",
+                    "verify-full": "require"}
+        connect_args["ssl"] = ssl_map.get(sslmode, "require")
+        # Rebuild URL without sslmode
+        new_query = urlencode(query, doseq=True)
+        parsed = parsed._replace(query=new_query)
+        url = urlunparse(parsed)
+
+    return url, connect_args
+
+
 def get_engine() -> AsyncEngine:
     """Get or create the async engine singleton."""
     global _engine
     if _engine is None:
         settings = get_settings()
+        url, connect_args = _normalize_database_url(settings.database_url)
         _engine = create_async_engine(
-            settings.database_url,
+            url,
             pool_size=20,
             max_overflow=10,
             pool_pre_ping=True,
             echo=settings.app_debug,
+            connect_args=connect_args,
         )
     return _engine
 
