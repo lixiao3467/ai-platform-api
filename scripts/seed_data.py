@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-from passlib.hash import bcrypt
+import bcrypt
 
 from ai_platform.domain.models import Permission, Role, Tenant, User
 from ai_platform.infra.database.connection import get_session_factory, init_db
@@ -102,7 +102,7 @@ async def seed() -> None:
         )
         session.add(tenant)
         await session.flush()
-        print(f"✓ Tenant: {tenant.name} ({tenant.id})")
+        print(f"[OK] Tenant: {tenant.name} ({tenant.id})")
 
         # --- Create permissions ---
         permissions: dict[tuple[str, str], Permission] = {}
@@ -118,7 +118,7 @@ async def seed() -> None:
                 permissions[(resource, action)] = perm
 
         await session.flush()
-        print(f"✓ Permissions: {len(permissions)} created")
+        print(f"[OK] Permissions: {len(permissions)} created")
 
         # --- Create system roles ---
         roles: dict[str, Role] = {}
@@ -144,7 +144,7 @@ async def seed() -> None:
             roles[role_def["name"]] = role
 
         await session.flush()
-        print(f"✓ Roles: {len(roles)} created ({', '.join(roles.keys())})")
+        print(f"[OK] Roles: {len(roles)} created ({', '.join(roles.keys())})")
 
         # --- Create admin user ---
         admin = User(
@@ -152,7 +152,7 @@ async def seed() -> None:
             tenant_id=tenant.id,
             username="admin",
             email="admin@ai-platform.local",
-            password_hash=bcrypt.hash("admin123"),
+            password_hash=bcrypt.hashpw("admin123".encode(), bcrypt.gensalt()).decode(),
             display_name="系统管理员",
             is_active=True,
             is_superadmin=True,
@@ -161,9 +161,9 @@ async def seed() -> None:
         session.add(admin)
 
         await session.commit()
-        print(f"✓ Admin user: admin / admin123 ({admin.id})")
+        print(f"[OK] Admin user: admin / admin123 ({admin.id})")
 
-    print("\n✅ Seed complete! Login at http://localhost:3001 with admin / admin123")
+    print("\n[SUCCESS] Seed complete! Login with admin / admin123")
 
 
 if __name__ == "__main__":

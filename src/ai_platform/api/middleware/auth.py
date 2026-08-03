@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 import structlog
 from fastapi import Depends, HTTPException, Request, status
 from jose import JWTError, jwt
-from passlib.hash import bcrypt
 
 from ai_platform.config import get_settings
 from ai_platform.infra.cache.redis_client import get_redis

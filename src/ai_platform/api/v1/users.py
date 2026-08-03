@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from passlib.hash import bcrypt
+import bcrypt
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -111,7 +111,7 @@ async def login(
     result = await session.execute(stmt)
     user = result.scalars().first()
 
-    if not user or not bcrypt.verify(req.password, user.password_hash):
+    if not user or not bcrypt.checkpw(req.password.encode(), user.password_hash.encode()):
         raise HTTPException(status_code=401, detail="用户名或密码错误")
 
     if not user.is_active:
@@ -189,7 +189,7 @@ async def create_user(
         tenant_id=ctx.tenant_id,
         username=req.username,
         email=req.email,
-        password_hash=bcrypt.hash(req.password),
+        password_hash=bcrypt.hashpw(req.password.encode(), bcrypt.gensalt()).decode(),
         display_name=req.display_name,
         phone=req.phone,
     )
@@ -274,7 +274,7 @@ async def reset_password(
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
 
-    user.password_hash = bcrypt.hash(new_password)
+    user.password_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
     await session.flush()
     return ApiResponse(message="密码已重置")
 
