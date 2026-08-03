@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from sqlalchemy.ext.asyncio import (
@@ -75,7 +74,6 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return _session_factory
 
 
-@asynccontextmanager
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """Dependency: yields an async database session."""
     factory = get_session_factory()
