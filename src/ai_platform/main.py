@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -141,44 +142,64 @@ def create_app() -> FastAPI:
     )
 
     # Middleware order matters — added in REVERSE execution order:
-    # (last added = first to execute)
+    # (last added = outermost = first to execute on request, last on response)
+    #
+    # Execution order (request → response):
+    #   request_context → CORS → ErrorHandler → Metrics → Security → Audit → [RateLimit] → endpoint
 
-    # 1. Error handler (outermost — catches everything)
-    from ai_platform.api.middleware.error_handler import ErrorHandlerMiddleware
-
-    app.add_middleware(ErrorHandlerMiddleware)
-
-    # 2. Audit logging (records every API call to database)
+    # 1. Audit logging (innermost — records every API call including errors)
     from ai_platform.api.middleware.audit import AuditMiddleware
 
     app.add_middleware(AuditMiddleware)
 
-    # 3. Security headers
+    # 2. Security headers
     from ai_platform.api.middleware.security import SecurityHeadersMiddleware
 
     app.add_middleware(SecurityHeadersMiddleware)
 
-    # 4. Prometheus metrics
+    # 3. Prometheus metrics
     from ai_platform.observability.metrics_middleware import MetricsMiddleware
 
     app.add_middleware(MetricsMiddleware)
 
-    # 2. CORS
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"] if settings.is_development else [],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # 4. Error handler (catches all downstream errors, returns standardized JSON)
+    from ai_platform.api.middleware.error_handler import ErrorHandlerMiddleware
 
-    # 3. Rate Limiting (production only)
+    app.add_middleware(ErrorHandlerMiddleware)
+
+    # 5. CORS — outermost so all responses (including errors) get proper CORS headers
+    # Note: allow_origins=["*"] is incompatible with allow_credentials=True per CORS spec.
+    # In dev, we use allow_origin_regex=".*" which FastAPI translates to per-request Origin echo.
+    if settings.is_development:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origin_regex=".*",  # Matches any origin (echoes Origin header)
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    else:
+        # Production: explicit origins via env var, or lock down completely
+        allowed_origins = [
+            o.strip()
+            for o in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+            if o.strip()
+        ]
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=allowed_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+    # 6. Rate Limiting (production only)
     if not settings.is_development:
         from ai_platform.api.middleware.rate_limit import RateLimitMiddleware
 
         app.add_middleware(RateLimitMiddleware)
 
-    # 4. Request context (timing + trace_id injection)
+    # 7. Request context (outermost — timing + trace_id injection, wraps everything)
     @app.middleware("http")
     async def request_context_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
         import time
@@ -187,22 +208,23 @@ def create_app() -> FastAPI:
         structlog.contextvars.bind_contextvars(trace_id=trace_id)
 
         start = time.perf_counter()
-        response = await call_next(request)
-        elapsed_ms = (time.perf_counter() - start) * 1000
-
-        response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.1f}"
-        response.headers["X-Trace-Id"] = trace_id
-
-        logger.info(
-            "Request completed",
-            method=request.method,
-            path=request.url.path,
-            status=response.status_code,
-            elapsed_ms=round(elapsed_ms, 1),
-        )
-
-        structlog.contextvars.clear_contextvars()
-        return response
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            response.headers["X-Process-Time-Ms"] = f"{(time.perf_counter() - start) * 1000:.1f}"
+            response.headers["X-Trace-Id"] = trace_id
+            return response
+        finally:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "Request completed",
+                method=request.method,
+                path=request.url.path,
+                status=status_code,
+                elapsed_ms=round(elapsed_ms, 1),
+            )
+            structlog.contextvars.clear_contextvars()
 
     # --- Liveness probe — instant 200 for infrastructure healthchecks ---
     @app.get("/live", tags=["system"], response_model=None)

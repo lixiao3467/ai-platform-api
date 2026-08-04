@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
 import structlog
+import sqlalchemy
 
 from ai_platform.config import get_settings
 
@@ -35,7 +39,7 @@ async def validate_startup() -> dict[str, bool]:
     # Log results
     for component, healthy in results.items():
         status = "OK" if healthy else "WARN"
-        logger.info(f"Startup check: [{status}] {component}")
+        logger.info("Startup check", component=component, status=status)
 
     # Report failed dependencies but DO NOT block startup.
     # In production, the health check endpoint (/health) will report degraded status.
@@ -58,9 +62,7 @@ async def _check_postgres() -> bool:
 
         engine = get_engine()
         async with engine.connect() as conn:
-            await conn.execute(
-                __import__("sqlalchemy").text("SELECT 1")
-            )
+            await conn.execute(sqlalchemy.text("SELECT 1"))
         return True
     except Exception as e:
         logger.error("PostgreSQL check failed", error=str(e))
@@ -82,7 +84,7 @@ async def _check_redis() -> bool:
 def _check_config() -> bool:
     """Validate critical configuration values."""
     settings = get_settings()
-    issues = []
+    issues: list[str] = []
 
     if not settings.app_secret_key or settings.app_secret_key.startswith("change-me"):
         issues.append("APP_SECRET_KEY must be changed from default")
@@ -98,65 +100,94 @@ def _check_config() -> bool:
 
     if issues:
         for issue in issues:
-            logger.warning(f"Config warning: {issue}")
+            logger.warning("Config warning", issue=issue)
         # Log warnings but don't block startup — /health will report degraded
 
     return True
 
 
-async def deep_health_check() -> dict:
+async def deep_health_check() -> dict[str, Any]:
     """
     Deep health check for /health endpoint.
 
     Checks all dependencies and returns detailed status.
+    Blocking synchronous calls are offloaded to a thread to avoid
+    freezing the event loop.
     """
-    health = {
+    health: dict[str, Any] = {
         "postgresql": False,
         "redis": False,
         "milvus": False,
         "litellm": False,
     }
 
-    # PostgreSQL
+    # Run all checks concurrently
+    tasks = [
+        _health_postgres(),
+        _health_redis(),
+        _health_milvus(),
+        _health_litellm(),
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    keys = ["postgresql", "redis", "milvus", "litellm"]
+    for key, result in zip(keys, results):
+        if isinstance(result, Exception):
+            logger.debug(f"Health check failed for {key}", error=str(result))
+            health[key] = False
+        else:
+            health[key] = bool(result)
+
+    return health
+
+
+async def _health_postgres() -> bool:
     try:
         from ai_platform.infra.database.connection import get_engine
 
         engine = get_engine()
         async with engine.connect() as conn:
-            await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
-        health["postgresql"] = True
+            await conn.execute(sqlalchemy.text("SELECT 1"))
+        return True
     except Exception:
-        pass
+        return False
 
-    # Redis
+
+async def _health_redis() -> bool:
     try:
         from ai_platform.infra.cache.redis_client import get_redis
 
         r = await get_redis()
-        health["redis"] = await r.ping()
+        return await r.ping()
     except Exception:
-        pass
+        return False
 
-    # Milvus
+
+async def _health_milvus() -> bool:
+    """Check Milvus — the MilvusClient constructor may do blocking I/O,
+    so we run it in a thread to avoid blocking the event loop."""
     try:
-        from pymilvus import MilvusClient
-        from ai_platform.config import get_settings as gs
+        settings = get_settings()
 
-        settings = gs()
-        client = MilvusClient(uri=settings.milvus_uri)
-        health["milvus"] = True
+        def _check() -> bool:
+            from pymilvus import MilvusClient
+
+            client = MilvusClient(uri=settings.milvus_uri)
+            # Perform a lightweight probe if available
+            return client is not None
+
+        return await asyncio.to_thread(_check)
     except Exception:
-        pass
+        return False
 
-    # LiteLLM proxy
+
+async def _health_litellm() -> bool:
     try:
         import httpx
 
         settings = get_settings()
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(f"{settings.litellm_api_base}/health/liveliness")
-            health["litellm"] = resp.status_code == 200
+            return resp.status_code == 200
     except Exception:
-        pass
-
-    return health
+        return False

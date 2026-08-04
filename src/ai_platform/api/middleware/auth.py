@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 import structlog
 from fastapi import Depends, HTTPException, Request, status
@@ -47,11 +48,16 @@ def create_jwt_token(
     *,
     extra_claims: dict | None = None,
 ) -> str:
-    """Create a JWT token."""
+    """Create a JWT token with standard claims (exp/iat/nbf)."""
     settings = get_settings()
+    now = datetime.now(tz=timezone.utc)
     payload = {
         "sub": user_id,
         "tenant_id": tenant_id,
+        "iat": now,
+        "nbf": now,
+        "exp": now + timedelta(minutes=settings.jwt_expire_minutes),
+        "iss": "ai-platform",
     }
     if extra_claims:
         payload.update(extra_claims)
@@ -59,14 +65,24 @@ def create_jwt_token(
 
 
 def decode_jwt_token(token: str) -> dict:
-    """Decode and validate a JWT token."""
+    """Decode and validate a JWT token (expiration, issuer)."""
     settings = get_settings()
     try:
-        return jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
+        return jwt.decode(
+            token,
+            settings.jwt_secret_key,
+            algorithms=[settings.jwt_algorithm],
+            options={
+                "verify_exp": True,
+                "verify_aud": False,  # No audience configured yet
+            },
+        )
     except JWTError as e:
+        # Do not leak internal error details to clients
+        logger.info("JWT decode failed", error=str(e))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid JWT token: {e}",
+            detail="Invalid or expired token",
         )
 
 

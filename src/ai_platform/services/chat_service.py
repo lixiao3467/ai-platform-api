@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 
@@ -97,6 +98,7 @@ class ChatService:
         Streaming chat completion.
 
         Yields SSE-formatted chunks. Persists the full response after streaming completes.
+        If the client disconnects mid-stream, the partial content is still persisted.
         """
         # 1. Get or create conversation
         conversation = await self._get_or_create_conversation(
@@ -124,28 +126,59 @@ class ChatService:
 
         yield f"data: {json.dumps({'conversation_id': str(conversation_id)})}\n\n"
 
-        async for chunk in self._llm.chat_stream(context_request):
-            # Extract content for persistence
-            if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
-                try:
-                    data = json.loads(chunk[6:].strip())
-                    delta = data.get("choices", [{}])[0].get("delta", {})
-                    if delta.get("content"):
-                        collected_content.append(delta["content"])
-                except (json.JSONDecodeError, IndexError, KeyError):
-                    pass
-            yield chunk
+        try:
+            async for chunk in self._llm.chat_stream(context_request):
+                # Extract content for persistence
+                if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
+                    try:
+                        data = json.loads(chunk[6:].strip())
+                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        if delta.get("content"):
+                            collected_content.append(delta["content"])
+                    except (json.JSONDecodeError, IndexError, KeyError):
+                        pass
+                yield chunk
+        except asyncio.CancelledError:
+            # Client disconnected mid-stream — persist partial content and re-raise
+            logger.warning(
+                "Client disconnected during stream",
+                conversation_id=str(conversation_id),
+                partial_content_len=sum(len(c) for c in collected_content),
+            )
+            await self._persist_stream_result(
+                conversation, collected_content, request.model
+            )
+            raise
 
-        # 6. Persist collected assistant message
+        # 6. Persist full assistant message
+        await self._persist_stream_result(
+            conversation, collected_content, request.model
+        )
+
+    async def _persist_stream_result(
+        self,
+        conversation: Conversation,
+        collected_content: list[str],
+        model: str,
+    ) -> None:
+        """Persist streamed assistant content. Safe to call even if stream was interrupted."""
         full_content = "".join(collected_content)
         if full_content:
-            await self._save_message(
-                conversation.id,
-                ChatMessage(role="assistant", content=full_content),
-                model=request.model,
-            )
-            conversation.message_count += 2
-            await self._db.flush()
+            try:
+                await self._save_message(
+                    conversation.id,
+                    ChatMessage(role="assistant", content=full_content),
+                    model=model,
+                )
+                conversation.message_count += 2
+                await self._db.flush()
+            except Exception as e:
+                # Stream persistence failure shouldn't crash the stream
+                logger.error(
+                    "Failed to persist streamed message",
+                    conversation_id=str(conversation.id),
+                    error=str(e),
+                )
 
     async def _get_or_create_conversation(
         self,

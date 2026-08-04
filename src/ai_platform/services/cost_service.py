@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import structlog
@@ -166,48 +166,61 @@ class CostService:
         *,
         days: int = 30,
     ) -> list[dict[str, Any]]:
-        """Get daily cost breakdown for the past N days."""
+        """Get daily cost breakdown for the past N days — single query."""
         now = datetime.now(tz=timezone.utc)
-        daily: list[dict[str, Any]] = []
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days)
 
-        for i in range(days):
-            day_start = now.replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ) - __import__("datetime").timedelta(days=i)
-            day_end = day_start + __import__("datetime").timedelta(days=1)
-
-            conditions = [
+        # Single query: group by date (truncated to day)
+        stmt = (
+            select(
+                func.date_trunc("day", AuditLog.created_at).label("day"),
+                func.coalesce(func.sum(AuditLog.token_input), 0).label("input_tokens"),
+                func.coalesce(func.sum(AuditLog.token_output), 0).label("output_tokens"),
+                func.count(AuditLog.id).label("requests"),
+            )
+            .where(
                 AuditLog.tenant_id == tenant_id,
-                AuditLog.created_at >= day_start,
-                AuditLog.created_at < day_end,
+                AuditLog.created_at >= cutoff,
                 AuditLog.token_input.isnot(None),
-            ]
+            )
+            .group_by(func.date_trunc("day", AuditLog.created_at))
+            .order_by(func.date_trunc("day", AuditLog.created_at))
+        )
+        result = await self._db.execute(stmt)
+        rows = result.all()
 
-            stmt = select(
-                func.coalesce(func.sum(AuditLog.token_input), 0),
-                func.coalesce(func.sum(AuditLog.token_output), 0),
-                func.count(AuditLog.id),
-            ).where(and_(*conditions))
+        # Build lookup: date -> row
+        daily_map: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            day_str = row.day.strftime("%Y-%m-%d") if hasattr(row.day, "strftime") else str(row.day)[:10]
+            daily_map[day_str] = {
+                "input_tokens": int(row.input_tokens or 0),
+                "output_tokens": int(row.output_tokens or 0),
+                "requests": int(row.requests or 0),
+            }
 
-            result = await self._db.execute(stmt)
-            row = result.first()
-
-            inp = row[0] or 0
-            out = row[1] or 0
-            count = row[2] or 0
-
-            # Estimate cost (use default pricing as approximation)
+        # Fill in the complete date range (including zero-request days)
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        daily: list[dict[str, Any]] = []
+        for i in range(days - 1, -1, -1):
+            day = today - timedelta(days=i)
+            day_str = day.strftime("%Y-%m-%d")
+            entry = daily_map.get(day_str, {
+                "input_tokens": 0, "output_tokens": 0, "requests": 0,
+            })
+            inp = entry["input_tokens"]
+            out = entry["output_tokens"]
+            # Estimate cost using default pricing as approximation
             est_cost = (inp / 1000) * 0.003 + (out / 1000) * 0.01
-
             daily.append({
-                "date": day_start.strftime("%Y-%m-%d"),
+                "date": day_str,
                 "input_tokens": inp,
                 "output_tokens": out,
-                "requests": count,
+                "requests": entry["requests"],
                 "estimated_cost_usd": round(est_cost, 4),
             })
 
-        return list(reversed(daily))  # chronological order
+        return daily
 
     async def check_budget(
         self,

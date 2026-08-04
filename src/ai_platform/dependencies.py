@@ -12,9 +12,15 @@ from ai_platform.infra.database.connection import get_db
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    """Provide an async database session."""
-    async with get_db() as session:
+    """Provide an async database session.
+
+    Thin wrapper around `get_db` for routes that prefer a dedicated name.
+    Usage in routes:
+        session: AsyncSession = Depends(get_session)
+    """
+    async for session in get_db():
         yield session
+        return
 
 
 # Convenience re-exports for route handlers

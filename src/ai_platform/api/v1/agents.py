@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
 from ai_platform.core.agent.runtime import AgentConfig, AgentRuntime
-from ai_platform.core.agent.tools.registry import ToolDefinition, get_tool_registry
+from ai_platform.core.agent.tools.registry import get_tool_registry
 from ai_platform.domain.models import Agent
 from ai_platform.infra.database.connection import get_db
 
@@ -84,6 +84,35 @@ async def create_agent(
         model=agent.model, tools=agent.tools, max_steps=agent.max_steps,
         status=agent.status, created_at=agent.created_at.isoformat(),
     ))
+
+
+# =============================================================================
+# Tool Management — MUST be declared BEFORE /{agent_id} routes
+# so FastAPI doesn't match "tools" as a UUID agent_id
+# =============================================================================
+
+
+@router.get("/tools", response_model=ApiResponse[list[dict]])
+async def list_tools(
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """List all available tools."""
+    registry = get_tool_registry()
+    tools = registry.list_tools()
+    return ApiResponse(data=[
+        {
+            "name": t.name,
+            "description": t.description,
+            "category": t.category,
+            "parameters": t.parameters,
+        }
+        for t in tools
+    ])
+
+
+# =============================================================================
+# Agent CRUD (parameterized routes — declared AFTER fixed paths like /tools)
+# =============================================================================
 
 
 @router.get("/", response_model=ApiResponse[PaginatedResponse[AgentOut]])
@@ -193,26 +222,3 @@ async def run_agent(
 
     result = await runtime.run(config, req.input, context=req.context)
     return ApiResponse(data=result)
-
-
-# =============================================================================
-# Tool Management
-# =============================================================================
-
-
-@router.get("/tools", response_model=ApiResponse[list[dict]])
-async def list_tools(
-    ctx: RequestContext = Depends(get_request_context),
-):
-    """List all available tools."""
-    registry = get_tool_registry()
-    tools = registry.list_tools()
-    return ApiResponse(data=[
-        {
-            "name": t.name,
-            "description": t.description,
-            "category": t.category,
-            "parameters": t.parameters,
-        }
-        for t in tools
-    ])

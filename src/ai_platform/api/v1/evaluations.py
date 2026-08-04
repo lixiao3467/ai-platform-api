@@ -42,6 +42,14 @@ class EvalRunRequest(BaseModel):
     generate_model: str = Field(default="qwen-max", description="Model being evaluated")
 
 
+class JudgeSingleRequest(BaseModel):
+    question: str
+    answer: str
+    contexts: list[str] = Field(default_factory=list)
+    expected_answer: str | None = None
+    judge_model: str = Field(default="gpt-4o")
+
+
 class EvalMetricOut(BaseModel):
     metric: str
     score: float
@@ -136,16 +144,14 @@ async def run_evaluation(
 
 @router.post("/judge", response_model=ApiResponse)
 async def judge_single(
-    question: str,
-    answer: str,
-    contexts: list[str] = [],
-    expected_answer: str | None = None,
-    judge_model: str = "gpt-4o",
+    req: JudgeSingleRequest,
     ctx: RequestContext = Depends(get_request_context),
 ):
     """Run LLM-as-Judge evaluation on a single Q&A pair."""
-    evaluator = RAGEvaluator(judge_model=judge_model)
-    metrics = await evaluator.evaluate_sample(question, answer, contexts, expected_answer)
+    evaluator = RAGEvaluator(judge_model=req.judge_model)
+    metrics = await evaluator.evaluate_sample(
+        req.question, req.answer, req.contexts, req.expected_answer
+    )
 
     return ApiResponse(data={
         "metrics": [

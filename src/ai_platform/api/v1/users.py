@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 import bcrypt
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -16,6 +16,17 @@ from ai_platform.api.middleware.auth import RequestContext, get_request_context,
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
 from ai_platform.domain.models import Permission, Role, User, role_permissions, user_roles
 from ai_platform.infra.database.connection import get_db
+
+
+def _parse_uuid_list(ids: list[str]) -> list[uuid.UUID]:
+    """Parse a list of string IDs to UUIDs, raising HTTP 422 on invalid format."""
+    result: list[uuid.UUID] = []
+    for raw in ids:
+        try:
+            result.append(uuid.UUID(raw))
+        except (ValueError, AttributeError):
+            raise HTTPException(status_code=422, detail=f"Invalid UUID format: {raw}")
+    return result
 
 users_router = APIRouter()
 roles_router = APIRouter()
@@ -52,6 +63,10 @@ class UserUpdateRequest(BaseModel):
     email: str | None = None
     is_active: bool | None = None
     role_ids: list[str] | None = None
+
+
+class ResetPasswordRequest(BaseModel):
+    new_password: str = Field(min_length=6)
 
 
 class UserOut(BaseModel):
@@ -179,10 +194,17 @@ async def create_user(
     session: AsyncSession = Depends(get_db),
 ):
     """创建用户。"""
-    # Check duplicate
-    existing = await session.execute(select(User).where(User.email == req.email))
-    if existing.scalars().first():
-        raise HTTPException(status_code=409, detail="邮箱已被注册")
+    # Check duplicate email OR username within tenant
+    existing = await session.execute(
+        select(User).where(
+            User.tenant_id == ctx.tenant_id,
+            (User.email == req.email) | (User.username == req.username),
+        )
+    )
+    duplicate = existing.scalars().first()
+    if duplicate:
+        field_name = "邮箱" if duplicate.email == req.email else "用户名"
+        raise HTTPException(status_code=409, detail=f"{field_name}已被注册")
 
     user = User(
         id=uuid.uuid4(),
@@ -196,7 +218,8 @@ async def create_user(
 
     # Assign roles
     if req.role_ids:
-        roles = await session.execute(select(Role).where(Role.id.in_([uuid.UUID(rid) for rid in req.role_ids])))
+        role_uuids = _parse_uuid_list(req.role_ids)
+        roles = await session.execute(select(Role).where(Role.id.in_(role_uuids)))
         user.roles = list(roles.scalars().all())
 
     session.add(user)
@@ -232,7 +255,8 @@ async def update_user(
         user.is_active = req.is_active
 
     if req.role_ids is not None:
-        roles = await session.execute(select(Role).where(Role.id.in_([uuid.UUID(rid) for rid in req.role_ids])))
+        role_uuids = _parse_uuid_list(req.role_ids)
+        roles = await session.execute(select(Role).where(Role.id.in_(role_uuids)))
         user.roles = list(roles.scalars().all())
 
     await session.flush()
@@ -264,7 +288,7 @@ async def delete_user(
 @users_router.post("/{user_id}/reset-password", response_model=ApiResponse)
 async def reset_password(
     user_id: uuid.UUID,
-    new_password: str = Query(..., min_length=6),
+    req: ResetPasswordRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
@@ -274,7 +298,7 @@ async def reset_password(
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
 
-    user.password_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+    user.password_hash = bcrypt.hashpw(req.new_password.encode(), bcrypt.gensalt()).decode()
     await session.flush()
     return ApiResponse(message="密码已重置")
 
@@ -332,9 +356,8 @@ async def create_role(
     )
 
     if req.permission_ids:
-        perms = await session.execute(
-            select(Permission).where(Permission.id.in_([uuid.UUID(pid) for pid in req.permission_ids]))
-        )
+        perm_uuids = _parse_uuid_list(req.permission_ids)
+        perms = await session.execute(select(Permission).where(Permission.id.in_(perm_uuids)))
         role.permissions = list(perms.scalars().all())
 
     session.add(role)
@@ -370,9 +393,8 @@ async def update_role(
         role.description = req.description
 
     if req.permission_ids is not None:
-        perms = await session.execute(
-            select(Permission).where(Permission.id.in_([uuid.UUID(pid) for pid in req.permission_ids]))
-        )
+        perm_uuids = _parse_uuid_list(req.permission_ids)
+        perms = await session.execute(select(Permission).where(Permission.id.in_(perm_uuids)))
         role.permissions = list(perms.scalars().all())
 
     await session.flush()

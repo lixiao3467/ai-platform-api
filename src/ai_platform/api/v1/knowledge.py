@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
 from ai_platform.api.schemas.chat import ChatCompletionRequest, ChatMessage
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
-from ai_platform.config import get_settings
 from ai_platform.core.knowledge.engine import KnowledgeEngine
 from ai_platform.core.model_router.litellm_client import get_llm_client
 from ai_platform.domain.models import Document, KnowledgeBase

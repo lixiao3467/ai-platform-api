@@ -9,11 +9,13 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    Column,
     DateTime,
     ForeignKey,
     Index,
     Integer,
     String,
+    Table,
     Text,
     func,
 )
@@ -469,19 +471,19 @@ class AuditLog(Base):
 # =============================================================================
 
 # Association table: user ↔ role (many-to-many)
-user_roles = __import__("sqlalchemy").Table(
+user_roles = Table(
     "user_roles",
     Base.metadata,
-    __import__("sqlalchemy").Column("user_id", UUID(as_uuid=True), ForeignKey("users.id"), primary_key=True),
-    __import__("sqlalchemy").Column("role_id", UUID(as_uuid=True), ForeignKey("roles.id"), primary_key=True),
+    Column("user_id", UUID(as_uuid=True), ForeignKey("users.id"), primary_key=True),
+    Column("role_id", UUID(as_uuid=True), ForeignKey("roles.id"), primary_key=True),
 )
 
 # Association table: role ↔ permission (many-to-many)
-role_permissions = __import__("sqlalchemy").Table(
+role_permissions = Table(
     "role_permissions",
     Base.metadata,
-    __import__("sqlalchemy").Column("role_id", UUID(as_uuid=True), ForeignKey("roles.id"), primary_key=True),
-    __import__("sqlalchemy").Column("permission_id", UUID(as_uuid=True), ForeignKey("permissions.id"), primary_key=True),
+    Column("role_id", UUID(as_uuid=True), ForeignKey("roles.id"), primary_key=True),
+    Column("permission_id", UUID(as_uuid=True), ForeignKey("permissions.id"), primary_key=True),
 )
 
 
