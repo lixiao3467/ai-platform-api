@@ -1,60 +1,22 @@
-# AI Core Service — Multi-stage Docker build
-# Uses pip (standard, reliable) instead of uv to avoid image registry issues
+FROM python:3.11-slim
 
-# =============================================================================
-# Stage 1: Builder — install dependencies
-# =============================================================================
-FROM python:3.11-slim AS builder
-
-WORKDIR /build
-
-# Install build tools for packages that need C compilation
-# (cryptography, asyncpg, etc.)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends gcc g++ libffi-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy dependency files first (layer caching — rarely changes)
-COPY pyproject.toml ./
-
-# Install uv for fast dependency resolution
-RUN pip install --no-cache-dir uv && \
-    uv venv /build/.venv && \
-    uv pip install --python /build/.venv/bin/python .
-
-# =============================================================================
-# Stage 2: Runtime — minimal production image
-# =============================================================================
-FROM python:3.11-slim AS runtime
-
-# Security: run as non-root user
-RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
-
 WORKDIR /app
 
-# Copy virtual environment from builder
-COPY --from=builder /build/.venv /app/.venv
+COPY pyproject.toml .
+RUN pip install --no-cache-dir .
 
-# Copy application source
-COPY src/ /app/src/
-COPY alembic/ /app/alembic/
-COPY alembic.ini /app/
-COPY config/ /app/config/
+COPY src/ src/
+COPY alembic/ alembic/
+COPY alembic.ini .
+COPY config/ config/
 
-# Add venv to PATH
-ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONPATH="/app/src"
 ENV PYTHONUNBUFFERED=1
 
-# Switch to non-root user
-USER appuser
-
-# Health check — fast liveness probe (stdlib only, no third-party deps)
-HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/live')"
-
-# Expose port
 EXPOSE 8000
 
-# Run the application
 CMD ["python", "-m", "uvicorn", "ai_platform.main:app", "--host", "0.0.0.0", "--port", "8000"]
