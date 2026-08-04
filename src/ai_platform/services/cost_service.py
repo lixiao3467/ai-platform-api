@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import structlog
-from sqlalchemy import func, select, and_
+from sqlalchemy import func, select, and_, literal_column
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_platform.domain.models import AuditLog
@@ -171,9 +171,11 @@ class CostService:
         cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days)
 
         # Single query: group by date (truncated to day)
+        # Use literal_column for exact SQL text match in GROUP BY / ORDER BY
+        day_expr = literal_column("date_trunc('day', audit_logs.created_at)")
         stmt = (
             select(
-                func.date_trunc("day", AuditLog.created_at).label("day"),
+                day_expr.label("day"),
                 func.coalesce(func.sum(AuditLog.token_input), 0).label("input_tokens"),
                 func.coalesce(func.sum(AuditLog.token_output), 0).label("output_tokens"),
                 func.count(AuditLog.id).label("requests"),
@@ -183,8 +185,8 @@ class CostService:
                 AuditLog.created_at >= cutoff,
                 AuditLog.token_input.isnot(None),
             )
-            .group_by(func.date_trunc("day", AuditLog.created_at))
-            .order_by(func.date_trunc("day", AuditLog.created_at))
+            .group_by(day_expr)
+            .order_by(day_expr)
         )
         result = await self._db.execute(stmt)
         rows = result.all()
