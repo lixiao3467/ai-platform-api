@@ -233,13 +233,17 @@ def create_app() -> FastAPI:
         all_ok = all(deps.values())
 
         return {
-            "status": "ok" if all_ok else "degraded",
-            "service": settings.app_name,
-            "version": app.version,
-            "env": settings.app_env,
-            "dependencies": {
-                k: "ok" if v else "degraded" for k, v in deps.items()
+            "code": 0,
+            "data": {
+                "status": "ok" if all_ok else "degraded",
+                "service": settings.app_name,
+                "version": app.version,
+                "env": settings.app_env,
+                "dependencies": {
+                    k: "ok" if v else "degraded" for k, v in deps.items()
+                },
             },
+            "message": "ok",
         }
 
     # --- Prometheus metrics endpoint ---
