@@ -7,7 +7,6 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
-import litellm
 import structlog
 
 from ai_platform.api.schemas.chat import (
@@ -27,8 +26,20 @@ from ai_platform.config import get_settings
 
 logger = structlog.get_logger()
 
-# Suppress LiteLLM's verbose logging
-litellm.suppress_debug_info = True
+# Lazy litellm import — defers the 3s import cost until first actual LLM call.
+# This keeps startup fast so Railway/Vercel healthchecks pass immediately.
+_litellm = None
+
+
+def _get_litellm():
+    """Lazy-load litellm on first use (heavy import: ~3s)."""
+    global _litellm
+    if _litellm is None:
+        import litellm
+
+        litellm.suppress_debug_info = True
+        _litellm = litellm
+    return _litellm
 
 
 class LiteLLMClient:
@@ -88,7 +99,7 @@ class LiteLLMClient:
         start_time = time.time()
 
         try:
-            response = await litellm.acompletion(**kwargs)
+            response = await _get_litellm().acompletion(**kwargs)
         except Exception as e:
             logger.error("LiteLLM call failed", model=request.model, error=str(e))
             raise
@@ -207,7 +218,7 @@ class LiteLLMClient:
         created = int(time.time())
 
         try:
-            response = await litellm.acompletion(**kwargs)
+            response = await _get_litellm().acompletion(**kwargs)
 
             async for chunk in response:
                 delta = chunk.choices[0].delta if chunk.choices else None

@@ -38,6 +38,7 @@ COPY src/ /app/src/
 COPY alembic/ /app/alembic/
 COPY alembic.ini /app/
 COPY config/ /app/config/
+COPY pyproject.toml /app/
 
 # Add venv to PATH
 ENV PATH="/app/.venv/bin:$PATH"
@@ -58,4 +59,5 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
 EXPOSE 8000
 
 # Run the application
-CMD ["python", "-m", "uvicorn", "ai_platform.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# PORT env var is set by Railway (defaults to 8000)
+CMD ["sh", "-c", "python -m uvicorn ai_platform.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

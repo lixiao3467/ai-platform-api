@@ -96,6 +96,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         "Starting AI Platform",
         env=settings.app_env,
         version=app.version,
+        python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
     )
 
     # --- Startup: initialize lazy singletons (fast, no blocking checks) ---
@@ -104,13 +105,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from ai_platform.infra.cache.redis_client import get_redis
     from ai_platform.infra.database.connection import init_db
 
-    await init_db()  # creates engine — no blocking connection test
+    # Initialize DB engine (no blocking connection test)
+    try:
+        await init_db()
+        logger.info("Database engine initialized")
+    except Exception as e:
+        logger.error("Database engine init failed", error=str(e))
+
     # Pre-warm Redis so first request doesn't trigger a slow lazy connect
     try:
         await get_redis()
+        logger.info("Redis client initialized")
     except Exception as e:
         logger.warning("Redis pre-warm failed (will retry on first use)", error=str(e))
 
+    logger.info("Startup complete — accepting traffic")
     yield
 
     # --- Shutdown ---
@@ -118,8 +127,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     from ai_platform.infra.database.connection import close_db
 
     logger.info("Shutting down AI Platform")
-    await close_redis()
-    await close_db()
+    try:
+        await close_redis()
+    except Exception:
+        pass
+    try:
+        await close_db()
+    except Exception:
+        pass
 
 
 # =============================================================================
