@@ -99,9 +99,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
     )
 
-    # --- Startup: just log, no blocking init ---
-    # DB/Redis connections are lazy — created on first request, not at startup.
-    # This ensures /live responds instantly so Railway healthchecks pass.
+    # --- Startup: init DB + auto-create tables ---
+    from ai_platform.infra.database.connection import init_db
+
+    try:
+        await init_db()
+        logger.info("Database initialized, tables ensured")
+    except Exception as e:
+        logger.error("Database init failed", error=str(e))
+
     logger.info("Startup complete — accepting traffic")
     yield
 

@@ -46,6 +46,15 @@ def _normalize_database_url(url: str) -> tuple[str, dict]:
     return url, connect_args
 
 
+async def init_db() -> None:
+    """Initialize DB engine and auto-create tables if they don't exist."""
+    engine = get_engine()
+    from ai_platform.domain.models import Base
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
 def get_engine() -> AsyncEngine:
     """Get or create the async engine singleton."""
     global _engine
