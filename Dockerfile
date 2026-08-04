@@ -49,9 +49,9 @@ ENV PYTHONUNBUFFERED=1
 # Switch to non-root user
 USER appuser
 
-# Health check — fast liveness probe
+# Health check — fast liveness probe (stdlib only, no third-party deps)
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
-    CMD python -c "import httpx; httpx.get('http://localhost:8000/live').raise_for_status()"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/live')"
 
 # Expose port
 EXPOSE 8000

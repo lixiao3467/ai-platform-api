@@ -99,42 +99,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
     )
 
-    # --- Startup: initialize lazy singletons (fast, no blocking checks) ---
-    # Deep health checks happen in /health endpoint, not here.
-    # This lets the app accept traffic immediately so Railway/infra healthchecks pass.
-    from ai_platform.infra.cache.redis_client import get_redis
-    from ai_platform.infra.database.connection import init_db
-
-    # Initialize DB engine (no blocking connection test)
-    try:
-        await init_db()
-        logger.info("Database engine initialized")
-    except Exception as e:
-        logger.error("Database engine init failed", error=str(e))
-
-    # Pre-warm Redis so first request doesn't trigger a slow lazy connect
-    try:
-        await get_redis()
-        logger.info("Redis client initialized")
-    except Exception as e:
-        logger.warning("Redis pre-warm failed (will retry on first use)", error=str(e))
-
+    # --- Startup: just log, no blocking init ---
+    # DB/Redis connections are lazy — created on first request, not at startup.
+    # This ensures /live responds instantly so Railway healthchecks pass.
     logger.info("Startup complete — accepting traffic")
     yield
 
     # --- Shutdown ---
-    from ai_platform.infra.cache.redis_client import close_redis
-    from ai_platform.infra.database.connection import close_db
-
     logger.info("Shutting down AI Platform")
-    try:
-        await close_redis()
-    except Exception:
-        pass
-    try:
-        await close_db()
-    except Exception:
-        pass
 
 
 # =============================================================================
@@ -244,7 +216,7 @@ def create_app() -> FastAPI:
     # --- Liveness probe — instant 200 for infrastructure healthchecks ---
     @app.get("/live", tags=["system"], response_model=None)
     async def liveness():
-        return {"status": "ok", "service": settings.app_name, "version": app.version}
+        return ORJSONResponse(status_code=200, content={"status": "success"})
 
     # --- Readiness / deep health check (may be slow) ---
     @app.get("/health", tags=["system"], response_model=None)
