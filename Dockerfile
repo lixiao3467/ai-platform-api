@@ -1,4 +1,5 @@
 # AI Core Service — Multi-stage Docker build
+# Uses pip (standard, reliable) instead of uv to avoid image registry issues
 
 # =============================================================================
 # Stage 1: Builder — install dependencies
@@ -7,20 +8,18 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-# Install build tools for packages that need C/Rust compilation
-# (cryptography, pymilvus, etc.) — required for source builds
+# Install build tools for packages that need C compilation
+# (cryptography, asyncpg, etc.)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends gcc g++ libffi-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv for fast dependency resolution
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-
 # Copy dependency files first (layer caching — rarely changes)
 COPY pyproject.toml ./
 
-# Install dependencies to a virtual environment
-RUN uv venv /build/.venv && \
+# Install uv for fast dependency resolution
+RUN pip install --no-cache-dir uv && \
+    uv venv /build/.venv && \
     uv pip install --python /build/.venv/bin/python .
 
 # =============================================================================
