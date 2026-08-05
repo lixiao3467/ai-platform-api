@@ -44,6 +44,18 @@ class ProviderUpdateKeyRequest(BaseModel):
     api_key: str = Field(description="New API key — will be encrypted before storage")
 
 
+class ProviderUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, description="Human-readable name")
+    api_base_url: str | None = Field(
+        default=None, description="Custom API base URL (for private deployments)"
+    )
+    models: list[dict[str, Any]] | None = Field(
+        default=None,
+        description='Model list, e.g. [{"name": "gpt-4o", "context_length": 128000}]',
+    )
+    priority: int | None = Field(default=None, description="Higher = preferred in routing")
+
+
 class ProviderOut(BaseModel):
     id: str
     provider_name: str
@@ -118,6 +130,32 @@ async def update_provider_key(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return ApiResponse(message="API key updated (encrypted)")
+
+
+@router.put("/providers/{provider_id}", response_model=ApiResponse[ProviderOut])
+async def update_provider(
+    provider_id: uuid.UUID,
+    req: ProviderUpdateRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """更新提供商配置（显示名称、API 地址、模型列表、优先级）。"""
+    svc = ProviderService(session)
+    try:
+        await svc.update_provider(
+            provider_id,
+            display_name=req.display_name,
+            api_base_url=req.api_base_url,
+            models=req.models,
+            priority=req.priority,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    # Return updated provider with masked key
+    providers = await svc.list_providers(ctx.tenant_id)
+    provider_data = next((p for p in providers if p["id"] == str(provider_id)), None)
+    return ApiResponse(data=ProviderOut(**provider_data))
 
 
 @router.put("/providers/{provider_id}/toggle", response_model=ApiResponse)

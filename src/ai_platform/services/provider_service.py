@@ -171,6 +171,33 @@ class ProviderService:
 
         return items
 
+    async def update_provider(
+        self,
+        provider_id: uuid.UUID,
+        *,
+        display_name: str | None = None,
+        api_base_url: str | None = None,
+        models: list[dict[str, Any]] | None = None,
+        priority: int | None = None,
+    ) -> ModelProvider:
+        """Update provider metadata (display_name, base_url, models, priority)."""
+        provider = await self._db.get(ModelProvider, provider_id)
+        if not provider:
+            raise ValueError(f"Provider {provider_id} not found")
+
+        if display_name is not None:
+            provider.display_name = display_name
+        if api_base_url is not None:
+            provider.api_base_url = api_base_url
+        if models is not None:
+            provider.models = models
+        if priority is not None:
+            provider.priority = priority
+
+        await self._db.flush()
+        logger.info("Provider updated", provider_id=str(provider_id))
+        return provider
+
     async def toggle_provider(self, provider_id: uuid.UUID, enabled: bool) -> None:
         """Enable or disable a provider."""
         provider = await self._db.get(ModelProvider, provider_id)
