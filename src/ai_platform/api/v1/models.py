@@ -87,6 +87,15 @@ class ProviderOut(BaseModel):
         default=False,
         description="True when api_base_url or api_key changed — provider was auto-disabled and needs a connectivity test before re-enabling.",
     )
+    last_test_at: str | None = Field(
+        default=None, description="ISO timestamp of last connectivity test (UTC)."
+    )
+    last_test_success: bool | None = Field(
+        default=None, description="Outcome of last connectivity test."
+    )
+    last_test_latency_ms: int | None = Field(
+        default=None, description="Latency of last connectivity test in ms."
+    )
 
 
 class ProviderTestResultOut(BaseModel):
@@ -94,6 +103,12 @@ class ProviderTestResultOut(BaseModel):
     latency_ms: int
     model: str
     message: str
+
+
+class ModelToggleRequest(BaseModel):
+    """B-07: typed body for per-model enable/disable endpoint."""
+
+    enabled: bool = Field(description="True to enable the model, False to disable.")
 
 
 # =============================================================================
@@ -232,7 +247,11 @@ async def toggle_provider(
     try:
         await svc.toggle_provider(provider_id, enabled)
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        err_msg = str(e)
+        # B-05: re-test requirement surfaces as 400 (not 404)
+        if "needs connectivity test" in err_msg:
+            raise HTTPException(status_code=400, detail=err_msg)
+        raise HTTPException(status_code=404, detail=err_msg)
     return ApiResponse(message=f"Provider {'enabled' if enabled else 'disabled'}")
 
 
@@ -467,7 +486,7 @@ async def get_default_internal(
 async def toggle_model_enabled(
     provider_id: uuid.UUID,
     model_name: str,
-    req: dict,  # {"enabled": bool}
+    req: ModelToggleRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
@@ -475,7 +494,7 @@ async def toggle_model_enabled(
     resolver = ModelResolverService(session)
     try:
         new_enabled = await resolver.set_model_enabled(
-            ctx.tenant_id, provider_id, model_name, req.get("enabled", True)
+            ctx.tenant_id, provider_id, model_name, req.enabled
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

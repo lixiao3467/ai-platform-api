@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 import structlog
@@ -64,12 +65,18 @@ class ProviderService:
         return provider
 
     async def update_api_key(self, provider_id: uuid.UUID, new_api_key: str) -> None:
-        """Update a provider's API key (re-encrypts)."""
+        """Update a provider's API key (re-encrypts).
+
+        B-08: changing the key invalidates the last connectivity test, so the
+        provider is auto-disabled and flagged for re-test.
+        """
         provider = await self._db.get(ModelProvider, provider_id)
         if not provider:
             raise ValueError(f"Provider {provider_id} not found")
 
         provider.api_key_ref = encrypt_secret(new_api_key)
+        provider.needs_retest = True
+        provider.is_enabled = False
         await self._db.flush()
 
         logger.info("Provider API key updated", provider_id=str(provider_id))
@@ -132,6 +139,9 @@ class ProviderService:
             models_config = provider.models or []
             for model_cfg in models_config:
                 if model_cfg.get("name") == model_name or model_cfg.get("id") == model_name:
+                    # B-06: skip models explicitly disabled in config
+                    if model_cfg.get("enabled") is False:
+                        continue
                     api_key = decrypt_secret(provider.api_key_ref) if provider.api_key_ref else None
                     return api_key, provider.api_base_url
 
@@ -169,6 +179,10 @@ class ProviderService:
                 "is_enabled": p.is_enabled,
                 "priority": p.priority,
                 "created_at": p.created_at.isoformat() if p.created_at else None,
+                "needs_retest": bool(p.needs_retest),
+                "last_test_at": p.last_test_at.isoformat() if p.last_test_at else None,
+                "last_test_success": p.last_test_success,
+                "last_test_latency_ms": p.last_test_latency_ms,
             })
 
         return items
@@ -216,6 +230,7 @@ class ProviderService:
 
         if needs_retest:
             provider.is_enabled = False
+            provider.needs_retest = True
 
         await self._db.flush()
         logger.info(
@@ -251,12 +266,14 @@ class ProviderService:
         api_base_url = provider.api_base_url
 
         if not api_key:
-            return {
+            result: dict[str, Any] = {
                 "success": False,
                 "latency_ms": 0,
                 "model": "",
                 "message": "Provider has no API key configured",
             }
+            await self._persist_test_result(provider, result)
+            return result
 
         # Lazy import to avoid startup cost
         from ai_platform.core.model_router.litellm_client import _get_litellm
@@ -273,12 +290,14 @@ class ProviderService:
 
         if not model_name:
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            return {
+            result = {
                 "success": False,
                 "latency_ms": elapsed_ms,
                 "model": "",
                 "message": "No enabled model configured for this provider",
             }
+            await self._persist_test_result(provider, result)
+            return result
 
         # litellm requires provider prefix. Use "openai/" for OpenAI-compatible
         # endpoints (most providers with custom api_base), otherwise use the
@@ -300,7 +319,7 @@ class ProviderService:
                 timeout=10,
             )
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            return {
+            result = {
                 "success": True,
                 "latency_ms": elapsed_ms,
                 "model": model_name,
@@ -308,7 +327,7 @@ class ProviderService:
             }
         except asyncio.TimeoutError:
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            return {
+            result = {
                 "success": False,
                 "latency_ms": elapsed_ms,
                 "model": model_name,
@@ -322,18 +341,39 @@ class ProviderService:
                 model=model_name,
                 error=str(exc),
             )
-            return {
+            result = {
                 "success": False,
                 "latency_ms": elapsed_ms,
                 "model": model_name,
                 "message": f"连接失败: {exc}",
             }
 
+        await self._persist_test_result(provider, result)
+        return result
+
+    async def _persist_test_result(
+        self, provider: ModelProvider, result: dict[str, Any]
+    ) -> None:
+        """Persist connectivity-test outcome onto the provider row (B-02)."""
+        provider.last_test_at = datetime.now(timezone.utc)
+        provider.last_test_success = result["success"]
+        provider.last_test_latency_ms = result["latency_ms"]
+        if result["success"]:
+            provider.needs_retest = False
+        await self._db.flush()
+
     async def toggle_provider(self, provider_id: uuid.UUID, enabled: bool) -> None:
         """Enable or disable a provider."""
         provider = await self._db.get(ModelProvider, provider_id)
         if not provider:
             raise ValueError(f"Provider {provider_id} not found")
+
+        # B-05: refuse to enable when connectivity has not been re-verified
+        if enabled and provider.needs_retest:
+            raise ValueError(
+                "Provider needs connectivity test before enabling. "
+                "Run POST /providers/{id}/test first."
+            )
 
         provider.is_enabled = enabled
         await self._db.flush()

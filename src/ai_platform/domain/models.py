@@ -496,6 +496,19 @@ class ModelProvider(Base):
     models: Mapped[list] = mapped_column(JSON, default=list)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     priority: Mapped[int] = mapped_column(Integer, default=0)
+    # --- Wave 1 B-01: connectivity-test tracking columns ---
+    last_test_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    last_test_success: Mapped[bool | None] = mapped_column(
+        Boolean, nullable=True, default=None
+    )
+    last_test_latency_ms: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=None
+    )
+    needs_retest: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

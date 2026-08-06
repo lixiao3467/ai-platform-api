@@ -109,6 +109,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     try:
         await init_db()
+        # B-01: ensure Wave-1 columns exist (temporary — replace with a real
+        # migration once Alembic is wired up). PostgreSQL supports
+        # ADD COLUMN IF NOT EXISTS since 9.6.
+        await _ensure_wave1_columns()
         logger.info("Database connection verified (schema managed by Alembic)")
     except Exception as e:
         logger.error("Database init failed", error=str(e))
@@ -362,6 +366,37 @@ AI Platform 是面向企业的 AI 能力中台，为 10-50 个内部业务系统
     app.include_router(api_router, prefix="/api/v1")
 
     return app
+
+
+# =============================================================================
+# Wave 1 schema backfill (temporary — replace with Alembic migration)
+# =============================================================================
+
+
+async def _ensure_wave1_columns() -> None:
+    """Add B-01 columns to ``model_providers`` if they are missing.
+
+    Idempotent: uses ``ADD COLUMN IF NOT EXISTS``.  This is a stop-gap until
+    a proper Alembic migration is introduced; safe to run on every startup.
+    """
+    from sqlalchemy import text
+
+    from ai_platform.infra.database.connection import get_engine
+
+    statements = [
+        "ALTER TABLE model_providers ADD COLUMN IF NOT EXISTS last_test_at timestamptz",
+        "ALTER TABLE model_providers ADD COLUMN IF NOT EXISTS last_test_success boolean",
+        "ALTER TABLE model_providers ADD COLUMN IF NOT EXISTS last_test_latency_ms integer",
+        "ALTER TABLE model_providers ADD COLUMN IF NOT EXISTS needs_retest boolean NOT NULL DEFAULT false",
+    ]
+
+    engine = get_engine()
+    async with engine.begin() as conn:
+        for stmt in statements:
+            try:
+                await conn.execute(text(stmt))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Wave-1 column migration skipped", stmt=stmt, error=str(exc))
 
 
 app = create_app()
