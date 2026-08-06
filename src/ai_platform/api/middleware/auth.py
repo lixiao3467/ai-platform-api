@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -15,6 +16,12 @@ from jose import JWTError, jwt
 
 from ai_platform.config import get_settings
 from ai_platform.infra.cache.redis_client import get_redis
+
+# Hard wall-clock cap for any single Redis call in the auth hot path.
+# The redis client already has socket_timeout=2s, but connection establishment
+# and a few edge cases can push individual calls past that. This keeps the
+# entire fallback chain bounded.
+_REDIS_OP_TIMEOUT_S = 2.0
 
 logger = structlog.get_logger()
 
@@ -86,7 +93,11 @@ def _is_redis_error(exc: BaseException) -> bool:
 
     We intentionally treat any Redis exception as "Redis is down" so the
     auth path falls back to DB instead of 500-ing on a transient blip.
+    asyncio.TimeoutError (from our wait_for wrappers) is also treated as a
+    Redis-side failure so the fallback path runs on deadline expiry.
     """
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
     try:
         import redis  # type: ignore[import-not-found]
 
@@ -189,13 +200,13 @@ async def revoke_refresh_token(jti: str) -> None:
     redis = await get_redis()
     # TTL matches max refresh token lifetime + 1 day buffer
     ttl = (settings.jwt_refresh_expire_days + 1) * 86400
-    await redis.setex(f"aip:rt_revoked:{jti}", ttl, "1")
+    await asyncio.wait_for(redis.setex(f"aip:rt_revoked:{jti}", ttl, "1"), timeout=_REDIS_OP_TIMEOUT_S)
 
 
 async def is_refresh_token_revoked(jti: str) -> bool:
     """Check whether a refresh token JTI has been revoked."""
     redis = await get_redis()
-    return bool(await redis.get(f"aip:rt_revoked:{jti}"))
+    return bool(await asyncio.wait_for(redis.get(f"aip:rt_revoked:{jti}"), timeout=_REDIS_OP_TIMEOUT_S))
 
 
 def decode_jwt_token(token: str) -> dict:
@@ -258,7 +269,7 @@ async def verify_api_key(raw_key: str) -> dict | None:
     # L2: Redis cache (degrade to DB on failure)
     try:
         redis = await get_redis()
-        cached = await redis.get(cache_key)
+        cached = await asyncio.wait_for(redis.get(cache_key), timeout=_REDIS_OP_TIMEOUT_S)
         if cached:
             metadata = json.loads(cached)
             # Check for negative cache sentinel in Redis too
@@ -344,7 +355,10 @@ async def verify_api_key(raw_key: str) -> dict | None:
         _perm_cache.set(cache_key, metadata, ttl_s=300.0)
         try:
             redis = await get_redis()
-            await redis.setex(cache_key, 300, json.dumps(metadata))
+            await asyncio.wait_for(
+                redis.setex(cache_key, 300, json.dumps(metadata)),
+                timeout=_REDIS_OP_TIMEOUT_S,
+            )
         except Exception as exc:
             if _is_redis_error(exc):
                 _redis_unavailable(exc, context="verify_api_key:cache_set")
@@ -463,7 +477,7 @@ async def _check_tenant_status(tenant_id: uuid.UUID) -> str:
     tenant_status: str | None = None
     try:
         redis = await get_redis()
-        cached = await redis.get(cache_key)
+        cached = await asyncio.wait_for(redis.get(cache_key), timeout=_REDIS_OP_TIMEOUT_S)
         if cached:
             tenant_status = cached
             _tenant_status_cache.set(cache_key, cached, ttl_s=60.0)
@@ -495,7 +509,10 @@ async def _check_tenant_status(tenant_id: uuid.UUID) -> str:
         _tenant_status_cache.set(cache_key, tenant_status, ttl_s=60.0)
         try:
             redis = await get_redis()
-            await redis.setex(cache_key, 300, tenant_status)
+            await asyncio.wait_for(
+                redis.setex(cache_key, 300, tenant_status),
+                timeout=_REDIS_OP_TIMEOUT_S,
+            )
         except Exception as exc:
             if _is_redis_error(exc):
                 _redis_unavailable(exc, context="_check_tenant_status:cache_set")
@@ -517,7 +534,7 @@ async def invalidate_tenant_status_cache(tenant_id: uuid.UUID) -> None:
     _tenant_status_cache.delete(cache_key)
     try:
         redis = await get_redis()
-        await redis.delete(cache_key)
+        await asyncio.wait_for(redis.delete(cache_key), timeout=_REDIS_OP_TIMEOUT_S)
     except Exception as exc:
         if _is_redis_error(exc):
             _redis_unavailable(exc, context="invalidate_tenant_status_cache")
@@ -606,7 +623,10 @@ async def get_request_context(request: Request) -> RequestContext:
             # Determine active role selection (stored in Redis)
             try:
                 redis = await get_redis()
-                active_role = await redis.get(f"aip:user:{user_id}:active_role")
+                active_role = await asyncio.wait_for(
+                    redis.get(f"aip:user:{user_id}:active_role"),
+                    timeout=_REDIS_OP_TIMEOUT_S,
+                )
             except Exception as exc:
                 if _is_redis_error(exc):
                     _redis_unavailable(exc, context="get_request_context:active_role")
@@ -628,7 +648,10 @@ async def get_request_context(request: Request) -> RequestContext:
                 # L2: Redis (degrade to DB on failure)
                 try:
                     redis = await get_redis()
-                    cached_perms = await redis.get(perm_cache_key)
+                    cached_perms = await asyncio.wait_for(
+                        redis.get(perm_cache_key),
+                        timeout=_REDIS_OP_TIMEOUT_S,
+                    )
                     if cached_perms:
                         perm_data = json.loads(cached_perms)
                         _perm_cache.set(perm_cache_key, perm_data, ttl_s=300.0)
@@ -666,7 +689,10 @@ async def get_request_context(request: Request) -> RequestContext:
                 # Best-effort Redis populate
                 try:
                     redis = await get_redis()
-                    await redis.setex(perm_cache_key, 300, json.dumps(perm_data))
+                    await asyncio.wait_for(
+                        redis.setex(perm_cache_key, 300, json.dumps(perm_data)),
+                        timeout=_REDIS_OP_TIMEOUT_S,
+                    )
                 except Exception as exc:
                     if _is_redis_error(exc):
                         _redis_unavailable(exc, context="get_request_context:perms:cache_set")

@@ -22,6 +22,13 @@ def _build_redis_kwargs(url: str) -> dict:
     kwargs: dict = {
         "decode_responses": True,
         "max_connections": 50,
+        # Fail fast when Redis is unreachable — auth fallback path depends on
+        # this bound. The previous default (no socket_timeout) let every Redis
+        # call block for ~14s on network-level failures (TCP handshake against
+        # a black-hole or a closed port that the OS retries silently).
+        "socket_timeout": 2.0,
+        "socket_connect_timeout": 2.0,
+        "retry_on_timeout": False,
     }
     parsed = urlparse(url)
     if parsed.scheme == "rediss":

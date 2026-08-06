@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -38,13 +39,19 @@ auth_router = APIRouter()
 
 
 _ACTIVE_ROLE_TTL_S = 30 * 86400  # 30 days
+# Hard cap on any single Redis op in the auth hot path (defense-in-depth
+# on top of socket_timeout=2 in redis_client).
+_REDIS_OP_TIMEOUT_S = 2.0
 
 
 async def _get_active_role_code(user_id: str) -> str | None:
     """Read the user's active role code from Redis (None = not set)."""
     try:
         redis = await get_redis()
-        return await redis.get(f"aip:user:{user_id}:active_role")
+        return await asyncio.wait_for(
+            redis.get(f"aip:user:{user_id}:active_role"),
+            timeout=_REDIS_OP_TIMEOUT_S,
+        )
     except Exception:
         return None
 
@@ -52,7 +59,10 @@ async def _get_active_role_code(user_id: str) -> str | None:
 async def _set_active_role_code(user_id: str, role_code: str) -> None:
     """Persist the user's active role code in Redis."""
     redis = await get_redis()
-    await redis.setex(f"aip:user:{user_id}:active_role", _ACTIVE_ROLE_TTL_S, role_code)
+    await asyncio.wait_for(
+        redis.setex(f"aip:user:{user_id}:active_role", _ACTIVE_ROLE_TTL_S, role_code),
+        timeout=_REDIS_OP_TIMEOUT_S,
+    )
 
 
 # =============================================================================
@@ -347,11 +357,12 @@ async def switch_role(
         # Delete base + role-suffixed keys via SCAN (best effort)
         cursor = 0
         while True:
-            cursor, keys = await redis.scan(
-                cursor=cursor, match=f"{perm_cache_key_full}*", count=100,
+            cursor, keys = await asyncio.wait_for(
+                redis.scan(cursor=cursor, match=f"{perm_cache_key_full}*", count=100),
+                timeout=_REDIS_OP_TIMEOUT_S,
             )
             if keys:
-                await redis.delete(*keys)
+                await asyncio.wait_for(redis.delete(*keys), timeout=_REDIS_OP_TIMEOUT_S)
             if cursor == 0:
                 break
     except Exception:
