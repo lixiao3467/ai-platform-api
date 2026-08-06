@@ -6,7 +6,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
@@ -26,6 +26,51 @@ router = APIRouter()
 # Schemas
 # =============================================================================
 
+# B-10: whitelist of known provider identifiers (runtime-validated, flexible).
+ALLOWED_PROVIDERS: set[str] = {
+    "openai",
+    "anthropic",
+    "qwen",
+    "deepseek",
+    "ollama",
+    "vllm",
+    "azure",
+    "google",
+    "cohere",
+    "mistral",
+    "xai",
+    "gemini",
+}
+
+
+class ModelConfigInput(BaseModel):
+    """B-11: typed schema for a model entry inside a provider config.
+
+    Replaces the previous ``dict[str, Any]`` so the API rejects malformed
+    payloads with a clear validation error instead of persisting garbage.
+    """
+
+    name: str = Field(description="Model identifier, e.g. 'gpt-4o'")
+    context_length: int | None = Field(
+        default=None, description="Max context tokens"
+    )
+    purposes: list[str] = Field(
+        default_factory=list,
+        description="Supported purposes: llm, vision, embedding, etc.",
+    )
+    capabilities: list[str] = Field(
+        default_factory=list, description="Additional capabilities"
+    )
+    enabled: bool = Field(
+        default=True, description="Whether this model is enabled"
+    )
+    input_price: float | None = Field(
+        default=None, description="Input price per 1M tokens (USD)"
+    )
+    output_price: float | None = Field(
+        default=None, description="Output price per 1M tokens (USD)"
+    )
+
 
 class ProviderCreateRequest(BaseModel):
     provider_name: str = Field(
@@ -38,7 +83,7 @@ class ProviderCreateRequest(BaseModel):
     api_key: str | None = Field(
         default=None, description="API key — will be encrypted before storage"
     )
-    models: list[dict[str, Any]] = Field(
+    models: list[ModelConfigInput] = Field(
         default_factory=list,
         description=(
             'Model list, e.g. [{"name": "gpt-4o", "context_length": 128000, '
@@ -46,6 +91,16 @@ class ProviderCreateRequest(BaseModel):
         ),
     )
     priority: int = Field(default=0, description="Higher = preferred in routing")
+
+    @field_validator("provider_name")
+    @classmethod
+    def validate_provider_name(cls, v: str) -> str:
+        normalised = v.lower().strip()
+        if normalised not in ALLOWED_PROVIDERS:
+            raise ValueError(
+                f"Unknown provider '{v}'. Allowed: {sorted(ALLOWED_PROVIDERS)}"
+            )
+        return normalised
 
 
 class ProviderUpdateKeyRequest(BaseModel):
@@ -63,7 +118,7 @@ class ProviderUpdateRequest(BaseModel):
         "Supplying a new key (or changing api_base_url) auto-disables the "
         "provider until connectivity is re-verified.",
     )
-    models: list[dict[str, Any]] | None = Field(
+    models: list[ModelConfigInput] | None = Field(
         default=None,
         description=(
             'Model list, e.g. [{"name": "gpt-4o", "context_length": 128000, '
@@ -135,7 +190,7 @@ async def create_provider(
         display_name=req.display_name,
         api_base_url=req.api_base_url,
         api_key=req.api_key,
-        models=req.models,
+        models=[m.model_dump(exclude_none=False) for m in req.models],
         priority=req.priority,
     )
 
@@ -195,7 +250,11 @@ async def update_provider(
             display_name=req.display_name,
             api_base_url=req.api_base_url,
             api_key=req.api_key,
-            models=req.models,
+            models=(
+                [m.model_dump(exclude_none=False) for m in req.models]
+                if req.models is not None
+                else None
+            ),
             priority=req.priority,
         )
     except ValueError as e:
@@ -294,10 +353,9 @@ async def list_models(
                 continue
             all_models.append({
                 "model_name": model_cfg.get("name", "unknown"),
-                "provider": p["provider_name"],
-                "display_name": p.get("display_name"),
+                "provider_name": p["provider_name"],
+                "provider_display": p.get("display_name"),
                 "context_length": model_cfg.get("context_length"),
-                "capabilities": model_cfg.get("capabilities", []),
                 "purposes": model_cfg.get("purposes", []),
                 "enabled": model_cfg.get("enabled", True),
                 "priority": p.get("priority", 0),

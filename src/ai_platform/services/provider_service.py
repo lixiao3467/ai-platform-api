@@ -40,8 +40,15 @@ class ProviderService:
         models: list[dict[str, Any]] | None = None,
         priority: int = 0,
     ) -> ModelProvider:
-        """Create a new provider with encrypted API key."""
+        """Create a new provider with encrypted API key.
+
+        B-09: when an api_key is supplied the provider is created disabled
+        (``is_enabled=False``) and flagged for connectivity re-test
+        (``needs_retest=True``).  Providers without a key (e.g. local ollama)
+        are enabled immediately.
+        """
         encrypted_key = encrypt_secret(api_key) if api_key else None
+        has_api_key = bool(api_key)
 
         provider = ModelProvider(
             id=uuid.uuid4(),
@@ -51,7 +58,8 @@ class ProviderService:
             api_base_url=api_base_url,
             api_key_ref=encrypted_key,
             models=models or [],
-            is_enabled=True,
+            is_enabled=not has_api_key,
+            needs_retest=has_api_key,
             priority=priority,
         )
         self._db.add(provider)
