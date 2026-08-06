@@ -57,6 +57,12 @@ class ProviderUpdateRequest(BaseModel):
     api_base_url: str | None = Field(
         default=None, description="Custom API base URL (for private deployments)"
     )
+    api_key: str | None = Field(
+        default=None,
+        description="New API key — will be encrypted before storage. "
+        "Supplying a new key (or changing api_base_url) auto-disables the "
+        "provider until connectivity is re-verified.",
+    )
     models: list[dict[str, Any]] | None = Field(
         default=None,
         description=(
@@ -77,6 +83,17 @@ class ProviderOut(BaseModel):
     is_enabled: bool
     priority: int
     created_at: str | None
+    needs_retest: bool = Field(
+        default=False,
+        description="True when api_base_url or api_key changed — provider was auto-disabled and needs a connectivity test before re-enabling.",
+    )
+
+
+class ProviderTestResultOut(BaseModel):
+    success: bool
+    latency_ms: int
+    model: str
+    message: str
 
 
 # =============================================================================
@@ -150,13 +167,19 @@ async def update_provider(
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
-    """更新提供商配置（显示名称、API 地址、模型列表、优先级）。"""
+    """更新提供商配置（显示名称、API 地址、API Key、模型列表、优先级）。
+
+    当 ``api_base_url`` 或 ``api_key`` 发生变更时，提供商会被自动禁用
+    （``is_enabled=False``），响应中 ``needs_retest=true`` 提示前端需要
+    先执行连通性测试再重新启用。
+    """
     svc = ProviderService(session)
     try:
-        await svc.update_provider(
+        _provider, needs_retest = await svc.update_provider(
             provider_id,
             display_name=req.display_name,
             api_base_url=req.api_base_url,
+            api_key=req.api_key,
             models=req.models,
             priority=req.priority,
         )
@@ -166,7 +189,35 @@ async def update_provider(
     # Return updated provider with masked key
     providers = await svc.list_providers(ctx.tenant_id)
     provider_data = next((p for p in providers if p["id"] == str(provider_id)), None)
+    if provider_data is not None:
+        provider_data["needs_retest"] = needs_retest
     return ApiResponse(data=ProviderOut(**provider_data))
+
+
+@router.post(
+    "/providers/{provider_id}/test",
+    response_model=ApiResponse[ProviderTestResultOut],
+    dependencies=[Depends(require_permission("model.manage"))],
+)
+async def test_provider(
+    provider_id: uuid.UUID,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """测试提供商连通性。
+
+    先尝试 ``litellm.amodels()``（轻量级，不消耗 token），若不可用
+    则使用第一个启用的模型发送极简 chat completion（``max_tokens=1``）。
+
+    超时 10 秒。
+    """
+    svc = ProviderService(session)
+    try:
+        result = await svc.test_provider(provider_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return ApiResponse(data=ProviderTestResultOut(**result))
 
 
 @router.put("/providers/{provider_id}/toggle", response_model=ApiResponse, dependencies=[Depends(require_permission("model.manage"))])

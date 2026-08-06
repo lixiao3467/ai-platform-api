@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
 from typing import Any
 
@@ -177,26 +179,188 @@ class ProviderService:
         *,
         display_name: str | None = None,
         api_base_url: str | None = None,
+        api_key: str | None = None,
         models: list[dict[str, Any]] | None = None,
         priority: int | None = None,
-    ) -> ModelProvider:
-        """Update provider metadata (display_name, base_url, models, priority)."""
+    ) -> tuple[ModelProvider, bool]:
+        """Update provider metadata (display_name, base_url, models, priority).
+
+        If *api_key* is provided it is encrypted and stored as ``api_key_ref``.
+
+        When ``api_base_url`` or ``api_key`` actually changes the provider is
+        automatically disabled (``is_enabled=False``) so that the caller must
+        re-test connectivity before re-enabling it.  The boolean returned
+        alongside the model indicates whether such a reset happened (useful
+        for setting ``needs_retest`` in the API response).
+        """
         provider = await self._db.get(ModelProvider, provider_id)
         if not provider:
             raise ValueError(f"Provider {provider_id} not found")
 
+        needs_retest = False
+
         if display_name is not None:
             provider.display_name = display_name
-        if api_base_url is not None:
+        if api_base_url is not None and api_base_url != provider.api_base_url:
             provider.api_base_url = api_base_url
+            needs_retest = True
+        if api_key is not None:
+            # Always treat a supplied key as a change — we can't compare
+            # against the encrypted value cheaply.
+            provider.api_key_ref = encrypt_secret(api_key)
+            needs_retest = True
         if models is not None:
             provider.models = models
         if priority is not None:
             provider.priority = priority
 
+        if needs_retest:
+            provider.is_enabled = False
+
         await self._db.flush()
-        logger.info("Provider updated", provider_id=str(provider_id))
-        return provider
+        logger.info(
+            "Provider updated",
+            provider_id=str(provider_id),
+            needs_retest=needs_retest,
+        )
+        return provider, needs_retest
+
+    # -----------------------------------------------------------------
+    # Connectivity test
+    # -----------------------------------------------------------------
+
+    async def test_provider(
+        self,
+        provider_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Test connectivity to a provider.
+
+        Strategy:
+        1. Try ``litellm.amodels()`` — lightweight, no token cost.
+        2. Fall back to a minimal chat completion (``max_tokens=1``) using the
+           first enabled model configured for the provider.
+
+        Returns a dict with keys: ``success``, ``latency_ms``, ``model``,
+        ``message``.
+        """
+        provider = await self._db.get(ModelProvider, provider_id)
+        if not provider:
+            raise ValueError(f"Provider {provider_id} not found")
+
+        api_key = decrypt_secret(provider.api_key_ref) if provider.api_key_ref else None
+        api_base_url = provider.api_base_url
+
+        if not api_key:
+            return {
+                "success": False,
+                "latency_ms": 0,
+                "model": "",
+                "message": "Provider has no API key configured",
+            }
+
+        # Lazy import to avoid startup cost
+        from ai_platform.core.model_router.litellm_client import _get_litellm
+
+        litellm = _get_litellm()
+        start = time.monotonic()
+
+        # --- Strategy 1: amodels() -----------------------------------------
+        try:
+            models_resp = await asyncio.wait_for(
+                litellm.amodels(api_key=api_key, api_base=api_base_url),
+                timeout=10,
+            )
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+
+            # amodels() returns different shapes depending on provider;
+            # try to extract a representative model name.
+            model_name = ""
+            if isinstance(models_resp, dict):
+                data = models_resp.get("data", [])
+                if data and isinstance(data, list):
+                    model_name = data[0].get("id", "") if isinstance(data[0], dict) else str(data[0])
+            elif isinstance(models_resp, list) and models_resp:
+                first = models_resp[0]
+                model_name = first.get("id", "") if isinstance(first, dict) else str(first)
+
+            return {
+                "success": True,
+                "latency_ms": elapsed_ms,
+                "model": model_name or "unknown",
+                "message": "连接成功",
+            }
+        except asyncio.TimeoutError:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            return {
+                "success": False,
+                "latency_ms": elapsed_ms,
+                "model": "",
+                "message": "Connection timed out (10s)",
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "amodels() unavailable, falling back to chat test",
+                provider_id=str(provider_id),
+                error=str(exc),
+            )
+
+        # --- Strategy 2: minimal chat completion ---------------------------
+        # Pick the first enabled model from the provider config.
+        model_name = ""
+        for cfg in (provider.models or []):
+            if cfg.get("enabled") is not False:
+                model_name = cfg.get("name") or cfg.get("id", "")
+                break
+
+        if not model_name:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            return {
+                "success": False,
+                "latency_ms": elapsed_ms,
+                "model": "",
+                "message": "No enabled model configured for this provider",
+            }
+
+        try:
+            await asyncio.wait_for(
+                litellm.acompletion(
+                    model=model_name,
+                    messages=[{"role": "user", "content": "hi"}],
+                    api_key=api_key,
+                    api_base=api_base_url,
+                    max_tokens=1,
+                ),
+                timeout=10,
+            )
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            return {
+                "success": True,
+                "latency_ms": elapsed_ms,
+                "model": model_name,
+                "message": "连接成功",
+            }
+        except asyncio.TimeoutError:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            return {
+                "success": False,
+                "latency_ms": elapsed_ms,
+                "model": model_name,
+                "message": "Connection timed out (10s)",
+            }
+        except Exception as exc:  # noqa: BLE001
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            logger.warning(
+                "Provider connectivity test failed",
+                provider_id=str(provider_id),
+                model=model_name,
+                error=str(exc),
+            )
+            return {
+                "success": False,
+                "latency_ms": elapsed_ms,
+                "model": model_name,
+                "message": f"连接失败: {exc}",
+            }
 
     async def toggle_provider(self, provider_id: uuid.UUID, enabled: bool) -> None:
         """Enable or disable a provider."""
