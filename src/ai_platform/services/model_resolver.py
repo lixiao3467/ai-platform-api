@@ -14,6 +14,7 @@ from typing import Any
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from ai_platform.config import get_settings
 from ai_platform.domain.models import ModelProvider
@@ -251,6 +252,7 @@ class ModelResolverService:
             )
 
         provider.models = models_list
+        flag_modified(provider, "models")  # Force SQLAlchemy to emit UPDATE for JSON column
         await self._db.flush()
 
         logger.info(
@@ -298,6 +300,7 @@ class ModelResolverService:
             )
 
         provider.models = models_list
+        flag_modified(provider, "models")  # Force SQLAlchemy to emit UPDATE for JSON column
         await self._db.flush()
 
         logger.info(
