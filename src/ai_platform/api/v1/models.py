@@ -238,6 +238,33 @@ async def list_models(
     return ApiResponse(data=all_models)
 
 
+@router.get("/available", response_model=ApiResponse[list[dict]], dependencies=[Depends(require_permission("model.read"))])
+async def list_available_models(
+    purpose: str | None = None,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """列出当前租户所有可用模型，支持按用途过滤（供前端 ModelSelector 使用）。"""
+    from ai_platform.services.model_resolver import ModelResolverService
+
+    resolver = ModelResolverService(session)
+    items = await resolver.list_available(ctx.tenant_id, purpose=purpose)
+    return ApiResponse(
+        data=[
+            {
+                "model_name": item.model_name,
+                "provider_name": item.provider_name,
+                "provider_display": item.provider_display,
+                "purposes": item.purposes,
+                "context_length": item.context_length,
+                "priority": item.priority,
+                "enabled": item.enabled,
+            }
+            for item in items
+        ]
+    )
+
+
 # =============================================================================
 # Purpose-based model resolution
 # =============================================================================
