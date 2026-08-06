@@ -153,7 +153,9 @@ async def login(
     session: AsyncSession = Depends(get_db),
 ):
     """用户登录 — 返回 access token + refresh token。"""
-    stmt = select(User).where(User.username == req.username).options(selectinload(User.roles))
+    stmt = select(User).where(User.username == req.username).options(
+        selectinload(User.roles).selectinload(Role.permissions)
+    )
     result = await session.execute(stmt)
     user = result.scalars().first()
 
@@ -183,7 +185,15 @@ async def login(
             "email": user.email,
             "display_name": user.display_name,
             "tenant_id": str(user.tenant_id),
-            "roles": [{"id": str(r.id), "name": r.name} for r in user.roles],
+            "roles": [
+                {"id": str(r.id), "name": r.name, "code": r.code or r.name}
+                for r in user.roles
+            ],
+            "permissions": ["*"] if user.is_superadmin else list({
+                f"{p.resource}.{p.action}"
+                for r in user.roles
+                for p in r.permissions
+            }),
             "is_superadmin": user.is_superadmin,
         },
     ))

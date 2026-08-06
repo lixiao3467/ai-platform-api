@@ -40,51 +40,124 @@ ACTIONS = [
     ("execute", "执行"),
 ]
 
-# Default system roles
+# Default system roles — 5 roles, 2-tier hierarchy
+# Platform tier: super_admin, platform_ops
+# Tenant tier: tenant_admin, tenant_developer, tenant_viewer
 SYSTEM_ROLES = [
     {
         "name": "超级管理员",
-        "description": "拥有所有权限，不可删除",
+        "code": "super_admin",
+        "description": "平台最高权限，管理所有资源、角色和系统配置",
         "is_system": True,
-        "permissions": "all",  # All permissions
+        "permissions": "all",  # All 75 permissions
     },
     {
-        "name": "管理员",
-        "description": "管理用户、模型、知识库等核心资源",
+        "name": "平台运营员",
+        "code": "platform_ops",
+        "description": "管理租户、模型、成本分析、用户和审计日志",
         "is_system": True,
-        "permissions": "all",
+        "permissions": "platform_ops",
     },
     {
-        "name": "开发者",
-        "description": "使用 AI 能力（对话、Agent、知识库），不能管理用户和系统设置",
+        "name": "租户管理员",
+        "code": "tenant_admin",
+        "description": "租户内最高权限，管理成员和全部AI能力",
         "is_system": True,
-        "permissions": [
-            # Full access to AI capabilities
-            ("chat", "create"), ("chat", "read"),
-            ("conversation", "create"), ("conversation", "read"), ("conversation", "delete"),
-            ("knowledge_base", "create"), ("knowledge_base", "read"), ("knowledge_base", "update"),
-            ("document", "create"), ("document", "read"), ("document", "delete"),
-            ("agent", "create"), ("agent", "read"), ("agent", "update"), ("agent", "execute"),
-            ("workflow", "create"), ("workflow", "read"), ("workflow", "update"), ("workflow", "execute"),
-            ("prompt", "create"), ("prompt", "read"), ("prompt", "update"),
-            ("evaluation", "create"), ("evaluation", "read"),
-            # Read-only for system resources
-            ("model_provider", "read"),
-            ("cost", "read"),
-            ("user", "read"),
-            ("role", "read"),
-            ("audit_log", "read"),
-        ],
+        "permissions": "tenant_admin",
     },
     {
-        "name": "观察者",
-        "description": "只读权限，可查看但不能修改",
+        "name": "租户开发者",
+        "code": "tenant_developer",
+        "description": "AI能力调用、Prompt/知识库/Agent/Workflow管理",
         "is_system": True,
-        "permissions": [
-            (r, "read") for r, _ in RESOURCES
-        ],
+        "permissions": "tenant_developer",
+    },
+    {
+        "name": "租户观察者",
+        "code": "tenant_viewer",
+        "description": "只读查看对话记录、用量和配置",
+        "is_system": True,
+        "permissions": "tenant_viewer",
     },
 ]
+
+# Permission sets by role code (used as lookup keys)
+# "all" = all 75 permissions
+# Named sets are defined below for clarity
+ROLE_PERMISSION_MAP: dict[str, str | list[tuple[str, str]]] = {
+    "super_admin": "all",
+    "platform_ops": "platform_ops",
+    "tenant_admin": "tenant_admin",
+    "tenant_developer": "tenant_developer",
+    "tenant_viewer": "tenant_viewer",
+}
+
+# Named permission sets — matches init_rbac.sql matrix exactly
+def _get_permission_set(role_code: str) -> list[tuple[str, str]]:
+    """Return the list of (resource, action) tuples for a named role."""
+    if role_code == "platform_ops":
+        # Platform management CRUD + all resources read-only
+        perms: list[tuple[str, str]] = []
+        # Full CRUD on platform management resources
+        for resource in ("tenant", "model_provider", "cost", "evaluation", "user"):
+            for action in ("create", "read", "update", "delete", "execute"):
+                perms.append((resource, action))
+        # Read-only on everything else
+        for resource, _ in RESOURCES:
+            if resource not in ("tenant", "model_provider", "cost", "evaluation", "user"):
+                perms.append((resource, "read"))
+        return perms
+
+    elif role_code == "tenant_admin":
+        perms = []
+        # Full CRUD on AI capability resources
+        for resource in (
+            "chat", "conversation", "knowledge_base", "document",
+            "agent", "tool", "workflow", "prompt",
+        ):
+            for action in ("create", "read", "update", "delete", "execute"):
+                perms.append((resource, action))
+        # model_provider: read + execute
+        perms.extend([("model_provider", "read"), ("model_provider", "execute")])
+        # evaluation: full CRUD + execute
+        for action in ("create", "read", "update", "delete", "execute"):
+            perms.append(("evaluation", action))
+        # cost: read only
+        perms.append(("cost", "read"))
+        # user: create + read + update
+        perms.extend([("user", "create"), ("user", "read"), ("user", "update")])
+        # role, tenant, audit_log: read only
+        for resource in ("role", "tenant", "audit_log"):
+            perms.append((resource, "read"))
+        return perms
+
+    elif role_code == "tenant_developer":
+        perms = []
+        # AI resources: create/read/update/execute (no delete)
+        for resource in (
+            "chat", "conversation", "knowledge_base",
+            "agent", "tool", "workflow", "prompt",
+        ):
+            for action in ("create", "read", "update", "execute"):
+                perms.append((resource, action))
+        # document: create/read/update only
+        for action in ("create", "read", "update"):
+            perms.append(("document", action))
+        # model_provider: read + execute
+        perms.extend([("model_provider", "read"), ("model_provider", "execute")])
+        # evaluation: create/read/update/execute (no delete)
+        for action in ("create", "read", "update", "execute"):
+            perms.append(("evaluation", action))
+        # Management resources: read only
+        for resource in ("cost", "user", "role", "tenant", "audit_log"):
+            perms.append((resource, "read"))
+        return perms
+
+    elif role_code == "tenant_viewer":
+        # All resources: read only
+        return [(r, "read") for r, _ in RESOURCES]
+
+    return []
 
 
 async def seed() -> None:
@@ -130,21 +203,30 @@ async def seed() -> None:
                 description=role_def["description"],
                 is_system=role_def["is_system"],
             )
+            # Set the code attribute if the model supports it
+            if hasattr(role, "code"):
+                role.code = role_def["code"]
 
-            if role_def["permissions"] == "all":
+            perm_key = role_def.get("permissions", role_def["code"])
+            if perm_key == "all":
                 role.permissions = list(permissions.values())
             else:
+                perm_tuples = _get_permission_set(role_def["code"])
                 role.permissions = [
                     permissions[(r, a)]
-                    for r, a in role_def["permissions"]
+                    for r, a in perm_tuples
                     if (r, a) in permissions
                 ]
 
             session.add(role)
             roles[role_def["name"]] = role
+            roles[role_def["code"]] = role  # Also index by code
 
         await session.flush()
-        print(f"[OK] Roles: {len(roles)} created ({', '.join(roles.keys())})")
+        role_summary = ", ".join(
+            f"{r['name']}({r['code']})" for r in SYSTEM_ROLES
+        )
+        print(f"[OK] Roles: {len(SYSTEM_ROLES)} created ({role_summary})")
 
         # --- Create admin user ---
         admin = User(
