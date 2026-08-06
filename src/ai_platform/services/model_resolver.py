@@ -261,6 +261,53 @@ class ModelResolverService:
         )
         return new_enabled
 
+    async def set_model_enabled(
+        self,
+        tenant_id: uuid.UUID,
+        provider_id: uuid.UUID,
+        model_name: str,
+        enabled: bool,
+    ) -> bool:
+        """Set ``enabled`` for a single model inside a provider.
+
+        Returns the new enabled state.
+
+        Raises:
+            ValueError: provider not found, not owned by tenant, or model
+                not present in the provider's ``models`` array.
+        """
+        provider = await self._db.get(ModelProvider, provider_id)
+        if not provider:
+            raise ValueError(f"Provider {provider_id} not found")
+
+        # Tenant isolation: only allow the owning tenant (or global admin).
+        if provider.tenant_id is not None and provider.tenant_id != tenant_id:
+            raise ValueError(f"Provider {provider_id} not found")
+
+        models_list: list[dict[str, Any]] = provider.models or []
+        found = False
+        for model_cfg in models_list:
+            if model_cfg.get("name") == model_name:
+                model_cfg["enabled"] = enabled
+                found = True
+                break
+
+        if not found:
+            raise ValueError(
+                f"Model '{model_name}' not found in provider {provider_id}"
+            )
+
+        provider.models = models_list
+        await self._db.flush()
+
+        logger.info(
+            "Model enabled state set",
+            provider_id=str(provider_id),
+            model=model_name,
+            enabled=enabled,
+        )
+        return enabled
+
     async def get_decrypted_key(
         self, provider_id: uuid.UUID
     ) -> str | None:

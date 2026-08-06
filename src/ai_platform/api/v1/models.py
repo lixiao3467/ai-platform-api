@@ -416,14 +416,15 @@ async def get_default_internal(
 async def toggle_model_enabled(
     provider_id: uuid.UUID,
     model_name: str,
+    req: dict,  # {"enabled": bool}
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
-    """切换单个模型的启用/禁用（不改 provider 级别）。"""
+    """设置单个模型的启用/禁用状态（前端控制目标状态）。"""
     resolver = ModelResolverService(session)
     try:
-        new_enabled = await resolver.toggle_model(
-            ctx.tenant_id, provider_id, model_name
+        new_enabled = await resolver.set_model_enabled(
+            ctx.tenant_id, provider_id, model_name, req.get("enabled", True)
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
