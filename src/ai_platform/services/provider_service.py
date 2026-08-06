@@ -264,47 +264,6 @@ class ProviderService:
         litellm = _get_litellm()
         start = time.monotonic()
 
-        # --- Strategy 1: amodels() -----------------------------------------
-        try:
-            models_resp = await asyncio.wait_for(
-                litellm.amodels(api_key=api_key, api_base=api_base_url),
-                timeout=10,
-            )
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-
-            # amodels() returns different shapes depending on provider;
-            # try to extract a representative model name.
-            model_name = ""
-            if isinstance(models_resp, dict):
-                data = models_resp.get("data", [])
-                if data and isinstance(data, list):
-                    model_name = data[0].get("id", "") if isinstance(data[0], dict) else str(data[0])
-            elif isinstance(models_resp, list) and models_resp:
-                first = models_resp[0]
-                model_name = first.get("id", "") if isinstance(first, dict) else str(first)
-
-            return {
-                "success": True,
-                "latency_ms": elapsed_ms,
-                "model": model_name or "unknown",
-                "message": "连接成功",
-            }
-        except asyncio.TimeoutError:
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            return {
-                "success": False,
-                "latency_ms": elapsed_ms,
-                "model": "",
-                "message": "Connection timed out (10s)",
-            }
-        except Exception as exc:  # noqa: BLE001
-            logger.info(
-                "amodels() unavailable, falling back to chat test",
-                provider_id=str(provider_id),
-                error=str(exc),
-            )
-
-        # --- Strategy 2: minimal chat completion ---------------------------
         # Pick the first enabled model from the provider config.
         model_name = ""
         for cfg in (provider.models or []):
@@ -321,10 +280,18 @@ class ProviderService:
                 "message": "No enabled model configured for this provider",
             }
 
+        # litellm requires provider prefix. Use "openai/" for OpenAI-compatible
+        # endpoints (most providers with custom api_base), otherwise use the
+        # provider_name as prefix.
+        if api_base_url:
+            litellm_model = f"openai/{model_name}"
+        else:
+            litellm_model = f"{provider.provider_name}/{model_name}"
+
         try:
             await asyncio.wait_for(
                 litellm.acompletion(
-                    model=model_name,
+                    model=litellm_model,
                     messages=[{"role": "user", "content": "hi"}],
                     api_key=api_key,
                     api_base=api_base_url,
