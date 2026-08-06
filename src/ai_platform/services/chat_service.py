@@ -46,6 +46,9 @@ class ChatService:
     ) -> ChatCompletionResponse:
         """Non-streaming chat completion with conversation persistence."""
 
+        # Resolve default model from DB when caller didn't specify one.
+        await self._resolve_default_model(request, tenant_id)
+
         # 1. Get or create conversation
         conversation = await self._get_or_create_conversation(
             request, tenant_id, app_id
@@ -100,6 +103,9 @@ class ChatService:
         Yields SSE-formatted chunks. Persists the full response after streaming completes.
         If the client disconnects mid-stream, the partial content is still persisted.
         """
+        # Resolve default model from DB when caller didn't specify one.
+        await self._resolve_default_model(request, tenant_id)
+
         # 1. Get or create conversation
         conversation = await self._get_or_create_conversation(
             request, tenant_id, app_id
@@ -180,6 +186,46 @@ class ChatService:
                     conversation_id=str(conversation.id),
                     error=str(e),
                 )
+
+    async def _resolve_default_model(
+        self,
+        request: ChatCompletionRequest,
+        tenant_id: uuid.UUID,
+    ) -> None:
+        """Fill in ``request.model`` from DB when not supplied by the caller.
+
+        Resolution order:
+        1. ``request.model`` already set (user-picked) → keep as-is.
+        2. ``ModelResolverService.get_default_for_purpose("llm")`` → use that.
+        3. ``ModelResolverService.get_env_fallback("llm")`` → use env default.
+        4. Hard-coded ``gpt-4o`` → last-resort fallback.
+        """
+        if request.model:
+            return
+
+        try:
+            from ai_platform.services.model_resolver import ModelResolverService
+
+            resolver = ModelResolverService(self._db)
+            config = await resolver.get_default_for_purpose(tenant_id, "llm")
+            if config is None:
+                config = resolver.get_env_fallback("llm")
+            if config is not None:
+                request.model = config.model_name
+                logger.info(
+                    "Chat default model resolved",
+                    tenant_id=str(tenant_id),
+                    model=config.model_name,
+                    source="db" if config.provider_id.int != 0 else "env",
+                )
+                return
+        except Exception as exc:
+            logger.warning(
+                "Default model resolution failed, using hard-coded fallback",
+                error=str(exc),
+            )
+
+        request.model = "gpt-4o"
 
     async def _get_or_create_conversation(
         self,

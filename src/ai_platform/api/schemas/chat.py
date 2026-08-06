@@ -52,7 +52,14 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible chat completion request."""
 
-    model: StrictStr = Field(default="gpt-4o", max_length=100, description="Model name configured in LiteLLM")
+    model: StrictStr | None = Field(
+        default=None,
+        max_length=100,
+        description=(
+            "Model name. When omitted, the tenant's highest-priority LLM "
+            "from 'model_providers' is resolved automatically."
+        ),
+    )
     messages: list[ChatMessage] = Field(min_length=1, max_length=100)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1, le=100000)
@@ -70,9 +77,11 @@ class ChatCompletionRequest(BaseModel):
 
     @field_validator("model")
     @classmethod
-    def validate_model(cls, v: str) -> str:
+    def validate_model(cls, v: str | None) -> str | None:
         """Validate model name - only allow alphanumeric, dash, underscore, dot."""
-        if not re.match(r"^[a-zA-Z0-9._-]+$", v):
+        if v is None:
+            return None
+        if not re.match(r"^[a-zA-Z0-9._/-]+$", v):
             raise ValueError("Model name contains invalid characters")
         return v
 

@@ -139,6 +139,7 @@ async def _process_document(
     content: bytes,
     filename: str,
     mime_type: str,
+    tenant_id: uuid.UUID | None = None,
 ) -> None:
     """Background task: parse → chunk → embed → store.
 
@@ -187,10 +188,10 @@ async def _process_document(
             await db.commit()
 
             # --- Embed (batch) + Store ---
-            from ai_platform.core.knowledge.embeddings.embedder import get_embedder
+            from ai_platform.core.knowledge.embeddings.embedder import create_embedder
             from ai_platform.core.knowledge.store.milvus_store import get_milvus_store
 
-            embedder = get_embedder()
+            embedder = await create_embedder(tenant_id, db)
             milvus = await get_milvus_store(kb.collection_name, kb.embedding_model)
 
             texts = [c.content for c in chunks]
@@ -455,7 +456,14 @@ async def upload_document(
 
     # 5. Kick off background processing (own DB session)
     task = asyncio.create_task(
-        _process_document(doc.id, kb.id, content, doc.filename, doc.mime_type or "text/plain")
+        _process_document(
+            doc.id,
+            kb.id,
+            content,
+            doc.filename,
+            doc.mime_type or "text/plain",
+            tenant_id=ctx.tenant_id,
+        )
     )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -565,7 +573,14 @@ async def retry_document(
     await session.commit()
 
     task = asyncio.create_task(
-        _process_document(doc.id, kb.id, content, doc.filename, doc.mime_type or "text/plain")
+        _process_document(
+            doc.id,
+            kb.id,
+            content,
+            doc.filename,
+            doc.mime_type or "text/plain",
+            tenant_id=ctx.tenant_id,
+        )
     )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -646,7 +661,7 @@ async def query_knowledge_base(
     if not kb or kb.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
 
-    engine = KnowledgeEngine(session)
+    engine = KnowledgeEngine(session, tenant_id=ctx.tenant_id)
     chunks = await engine.query(
         req.question, [kb_id],
         top_k=req.top_k, score_threshold=req.score_threshold,

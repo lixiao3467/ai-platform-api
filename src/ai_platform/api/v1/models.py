@@ -13,6 +13,10 @@ from ai_platform.api.middleware.auth import RequestContext, get_request_context
 from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse
 from ai_platform.infra.database.connection import get_db
+from ai_platform.services.model_resolver import (
+    ModelResolverService,
+    VALID_PURPOSES,
+)
 from ai_platform.services.provider_service import ProviderService
 
 router = APIRouter()
@@ -36,7 +40,10 @@ class ProviderCreateRequest(BaseModel):
     )
     models: list[dict[str, Any]] = Field(
         default_factory=list,
-        description='Model list, e.g. [{"name": "gpt-4o", "context_length": 128000}]',
+        description=(
+            'Model list, e.g. [{"name": "gpt-4o", "context_length": 128000, '
+            '"purposes": ["llm", "vision"], "enabled": true}]'
+        ),
     )
     priority: int = Field(default=0, description="Higher = preferred in routing")
 
@@ -52,7 +59,10 @@ class ProviderUpdateRequest(BaseModel):
     )
     models: list[dict[str, Any]] | None = Field(
         default=None,
-        description='Model list, e.g. [{"name": "gpt-4o", "context_length": 128000}]',
+        description=(
+            'Model list, e.g. [{"name": "gpt-4o", "context_length": 128000, '
+            '"purposes": ["llm", "vision"], "enabled": true}]'
+        ),
     )
     priority: int | None = Field(default=None, description="Higher = preferred in routing")
 
@@ -209,12 +219,188 @@ async def list_models(
         if not p["is_enabled"]:
             continue
         for model_cfg in p.get("models", []):
+            # Backward compatible: missing enabled means True
+            if model_cfg.get("enabled") is False:
+                continue
             all_models.append({
                 "model_name": model_cfg.get("name", "unknown"),
                 "provider": p["provider_name"],
                 "display_name": p.get("display_name"),
                 "context_length": model_cfg.get("context_length"),
                 "capabilities": model_cfg.get("capabilities", []),
+                "purposes": model_cfg.get("purposes", []),
+                "enabled": model_cfg.get("enabled", True),
+                "priority": p.get("priority", 0),
             })
 
+    # Sort by priority DESC
+    all_models.sort(key=lambda x: x.get("priority", 0), reverse=True)
     return ApiResponse(data=all_models)
+
+
+# =============================================================================
+# Purpose-based model resolution
+# =============================================================================
+
+
+class DefaultConfigOut(BaseModel):
+    """Public default-config response (no credentials)."""
+
+    provider_name: str
+    provider_display: str | None
+    model_name: str
+    purposes: list[str]
+    context_length: int | None
+    source: str = Field(description="'db' or 'env'")
+
+
+@router.get(
+    "/default-config/{purpose}",
+    response_model=ApiResponse[DefaultConfigOut],
+    dependencies=[Depends(require_permission("model.read"))],
+)
+async def get_default_config(
+    purpose: str,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """返回指定用途下优先级最高的模型配置（不含密钥，普通用户可用）。"""
+    if purpose not in VALID_PURPOSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid purpose '{purpose}'. Valid values: {sorted(VALID_PURPOSES)}",
+        )
+
+    resolver = ModelResolverService(session)
+    config = await resolver.get_default_for_purpose(ctx.tenant_id, purpose)
+
+    if config is None:
+        # Try env fallback
+        config = resolver.get_env_fallback(purpose)
+        if config is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No model configured for purpose '{purpose}'",
+            )
+        return ApiResponse(
+            data=DefaultConfigOut(
+                provider_name=config.provider_name,
+                provider_display=config.provider_display,
+                model_name=config.model_name,
+                purposes=config.purposes,
+                context_length=config.context_length,
+                source="env",
+            )
+        )
+
+    return ApiResponse(
+        data=DefaultConfigOut(
+            provider_name=config.provider_name,
+            provider_display=config.provider_display,
+            model_name=config.model_name,
+            purposes=config.purposes,
+            context_length=config.context_length,
+            source="db",
+        )
+    )
+
+
+class DefaultInternalOut(BaseModel):
+    """Internal default response (includes decrypted credentials)."""
+
+    provider_name: str
+    provider_display: str | None
+    model_name: str
+    api_base_url: str | None
+    api_key: str | None
+    purposes: list[str]
+    context_length: int | None
+    source: str
+
+
+@router.get(
+    "/default/{purpose}",
+    response_model=ApiResponse[DefaultInternalOut],
+    dependencies=[Depends(require_permission("model.manage"))],
+)
+async def get_default_internal(
+    purpose: str,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """返回指定用途下优先级最高的模型配置（含解密密钥）。
+
+    ⚠️  仅限内部服务或管理员调用 — 响应中包含明文 API Key。
+    需要 ``model.manage`` 权限（或 super-admin / ``*`` 超级权限）。
+    """
+    if purpose not in VALID_PURPOSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid purpose '{purpose}'. Valid values: {sorted(VALID_PURPOSES)}",
+        )
+
+    resolver = ModelResolverService(session)
+    config = await resolver.get_default_for_purpose(ctx.tenant_id, purpose)
+
+    if config is None:
+        config = resolver.get_env_fallback(purpose)
+        if config is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No model configured for purpose '{purpose}'",
+            )
+        return ApiResponse(
+            data=DefaultInternalOut(
+                provider_name=config.provider_name,
+                provider_display=config.provider_display,
+                model_name=config.model_name,
+                api_base_url=config.api_base_url,
+                api_key=config.api_key,
+                purposes=config.purposes,
+                context_length=config.context_length,
+                source="env",
+            )
+        )
+
+    return ApiResponse(
+        data=DefaultInternalOut(
+            provider_name=config.provider_name,
+            provider_display=config.provider_display,
+            model_name=config.model_name,
+            api_base_url=config.api_base_url,
+            api_key=config.api_key,
+            purposes=config.purposes,
+            context_length=config.context_length,
+            source="db",
+        )
+    )
+
+
+# =============================================================================
+# Per-model toggle (inside a provider)
+# =============================================================================
+
+
+@router.post(
+    "/providers/{provider_id}/models/{model_name}/toggle",
+    response_model=ApiResponse,
+    dependencies=[Depends(require_permission("model.manage"))],
+)
+async def toggle_model_enabled(
+    provider_id: uuid.UUID,
+    model_name: str,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """切换单个模型的启用/禁用（不改 provider 级别）。"""
+    resolver = ModelResolverService(session)
+    try:
+        new_enabled = await resolver.toggle_model(
+            ctx.tenant_id, provider_id, model_name
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return ApiResponse(
+        message=f"Model '{model_name}' {'enabled' if new_enabled else 'disabled'}"
+    )

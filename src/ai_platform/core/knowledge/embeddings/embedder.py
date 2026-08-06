@@ -1,6 +1,18 @@
-"""Embedding generation — abstracts embedding model providers."""
+"""Embedding generation — abstracts embedding model providers.
+
+Supports two resolution paths:
+1. **Environment config** (default / dev): uses ``settings.embedding_model``
+   together with the LiteLLM proxy base URL / master key.
+2. **Database config** (tenant-specific): when ``tenant_id`` and ``session``
+   are provided, the embedder is resolved via
+   :class:`ModelResolverService` with ``purpose="embedding"``.  This lets
+   each tenant bring their own embedding model / API key.
+"""
 
 from __future__ import annotations
+
+import uuid
+from typing import Any
 
 import structlog
 from litellm import aembedding
@@ -13,12 +25,18 @@ logger = structlog.get_logger()
 class Embedder:
     """Generate text embeddings via LiteLLM (unified interface)."""
 
-    def __init__(self, model: str | None = None, dimensions: int | None = None) -> None:
+    def __init__(
+        self,
+        model: str | None = None,
+        dimensions: int | None = None,
+        api_base: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
         settings = get_settings()
         self._model = model or settings.embedding_model
         self._dimensions = dimensions or settings.embedding_dimensions
-        self._api_base = settings.litellm_api_base
-        self._api_key = settings.litellm_master_key
+        self._api_base = api_base or settings.litellm_api_base
+        self._api_key = api_key or settings.litellm_master_key
 
     async def embed(self, text: str) -> list[float]:
         """Embed a single text string."""
@@ -52,11 +70,71 @@ class Embedder:
         return all_embeddings
 
 
+async def create_embedder(
+    tenant_id: uuid.UUID | None = None,
+    session: Any | None = None,
+) -> Embedder:
+    """Create an Embedder, optionally resolved from tenant DB config.
+
+    Resolution priority:
+    1. If ``tenant_id`` + ``session`` provided: call
+       ``ModelResolverService.get_default_for_purpose("embedding")``.
+    2. If no DB match (or no session provided): fall back to
+       ``settings.embedding_model`` + LiteLLM proxy credentials.
+    """
+    if tenant_id and session:
+        try:
+            from ai_platform.services.model_resolver import ModelResolverService
+
+            resolver = ModelResolverService(session)
+            config = await resolver.get_default_for_purpose(
+                tenant_id, "embedding"
+            )
+
+            if config is not None:
+                # Use a provider/model form when we have both pieces so that
+                # LiteLLM routes to the right provider directly.
+                model_name = config.model_name
+                if (
+                    "/" not in model_name
+                    and config.provider_name
+                    and config.provider_name != "env"
+                ):
+                    model_name = f"{config.provider_name}/{model_name}"
+
+                logger.info(
+                    "Embedder resolved from DB",
+                    tenant_id=str(tenant_id),
+                    model=model_name,
+                    provider=config.provider_name,
+                )
+
+                return Embedder(
+                    model=model_name,
+                    api_base=config.api_base_url,
+                    api_key=config.api_key,
+                )
+        except Exception as exc:
+            logger.warning(
+                "DB embedder resolution failed, falling back to env",
+                tenant_id=str(tenant_id),
+                error=str(exc),
+            )
+
+    return Embedder()
+
+
+# Backward-compat shim: environment-only singleton.
+# Prefer ``create_embedder`` in new code.
 _embedder: Embedder | None = None
 
 
 def get_embedder() -> Embedder:
-    """Get or create the embedder singleton."""
+    """Get or create the env-configured embedder singleton.
+
+    .. deprecated::
+        Use :func:`create_embedder` for tenant-aware resolution.
+    """
     global _embedder
     if _embedder is None:
         _embedder = Embedder()

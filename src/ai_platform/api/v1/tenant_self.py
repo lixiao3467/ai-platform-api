@@ -32,6 +32,7 @@ from ai_platform.domain.models import (
     user_roles,
 )
 from ai_platform.infra.database.connection import get_db
+from ai_platform.services.model_resolver import VALID_PURPOSES, ModelResolverService
 
 router = APIRouter()
 
@@ -97,6 +98,35 @@ class MemberRoleUpdateRequest(BaseModel):
 class ModelAccessOut(BaseModel):
     model_id: str
     is_enabled: bool
+    rate_limit: int | None = None
+    quota_limit: int | None = None
+    quota_used: int = 0
+
+
+class TenantAvailableModel(BaseModel):
+    """Aggregated model info returned by ``/self/models``.
+
+    Flattens each ``(provider, model)`` pair into one entry, so the front-end
+    can render a single list for "which models can I use?".
+
+    Backward compatible with the legacy ``ModelAccessOut`` shape — old fields
+    are kept (with best-effort values) while new fields expose the richer
+    provider-aware data.
+    """
+
+    # --- New shape (front-end canonical) ---
+    name: str
+    provider: str
+    display_name: str | None = None
+    status: str = "available"  # "available" | "unavailable"
+    quota_remaining: int | None = None
+
+    # --- Purpose tags (llm / embedding / vision / …) ---
+    purposes: list[str] = Field(default_factory=list)
+
+    # --- Legacy compatibility (kept so older front-ends keep working) ---
+    model_id: str | None = None
+    is_enabled: bool = True
     rate_limit: int | None = None
     quota_limit: int | None = None
     quota_used: int = 0
@@ -410,38 +440,96 @@ async def update_member_role(
 
 @router.get(
     "/self/models",
-    response_model=ApiResponse[list[ModelAccessOut]],
+    response_model=ApiResponse[list[TenantAvailableModel]],
     summary="查看可用模型",
     dependencies=[Depends(require_permission("model.read"))],
 )
 async def list_tenant_models(
+    purpose: str | None = Query(
+        default=None,
+        description="Filter by purpose: llm | embedding | vision | multimodal | general | chat",
+    ),
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """List models available to the current tenant.
 
-    If the tenant_model_access table has entries for this tenant, return those.
-    Otherwise, return a default list based on the tenant's plan.
+    Aggregates from the provider configurations (``model_providers`` table)
+    via :class:`ModelResolverService`.  Each ``(provider, model)`` pair
+    becomes one entry in the response.
+
+    Optional query param:
+        ``?purpose=embedding`` — only return models tagged with that purpose.
     """
+    # Validate purpose param early (so bad requests get a clean 400).
+    if purpose is not None:
+        if purpose not in VALID_PURPOSES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid purpose '{purpose}'. "
+                    f"Valid values: {sorted(VALID_PURPOSES)}"
+                ),
+            )
+
+    # --- Aggregated path (providers table is source of truth) ------------
+    try:
+        resolver = ModelResolverService(session)
+        items = await resolver.list_available(ctx.tenant_id, purpose=purpose)
+
+        if items:
+            return ApiResponse(
+                data=[
+                    TenantAvailableModel(
+                        name=item.model_name,
+                        provider=item.provider_name,
+                        display_name=item.provider_display,
+                        status="available" if item.enabled else "unavailable",
+                        quota_remaining=None,
+                        purposes=item.purposes,
+                        model_id=f"{item.provider_name}/{item.model_name}",
+                        is_enabled=item.enabled,
+                    )
+                    for item in items
+                ]
+            )
+    except Exception:
+        # Fall through to legacy behaviour on unexpected errors so existing
+        # tenants keep working even if the resolver misbehaves.
+        pass
+
+    # --- Legacy fallback (table may be empty / not migrated yet) ----------
     # Try to read from tenant_model_access (after migration)
     try:
         from sqlalchemy import text
-        result = await session.execute(text(
-            "SELECT model_id, is_enabled, rate_limit, quota_limit, quota_used "
-            "FROM tenant_model_access WHERE tenant_id = :tid ORDER BY model_id"
-        ), {"tid": str(ctx.tenant_id)})
+
+        result = await session.execute(
+            text(
+                "SELECT model_id, is_enabled, rate_limit, quota_limit, quota_used "
+                "FROM tenant_model_access WHERE tenant_id = :tid ORDER BY model_id"
+            ),
+            {"tid": str(ctx.tenant_id)},
+        )
         rows = result.fetchall()
         if rows:
-            return ApiResponse(data=[
-                ModelAccessOut(
-                    model_id=row[0],
-                    is_enabled=row[1],
-                    rate_limit=row[2],
-                    quota_limit=row[3],
-                    quota_used=row[4],
-                )
-                for row in rows
-            ])
+            return ApiResponse(
+                data=[
+                    TenantAvailableModel(
+                        name=row[0],
+                        provider="unknown",
+                        display_name=None,
+                        status="available" if row[1] else "unavailable",
+                        quota_remaining=None,
+                        purposes=[],
+                        model_id=row[0],
+                        is_enabled=row[1],
+                        rate_limit=row[2],
+                        quota_limit=row[3],
+                        quota_used=row[4],
+                    )
+                    for row in rows
+                ]
+            )
     except Exception:
         pass  # Table may not exist yet
 
@@ -452,14 +540,39 @@ async def list_tenant_models(
     default_models = {
         "free": ["gpt-3.5-turbo"],
         "standard": ["gpt-3.5-turbo", "gpt-4o", "qwen-plus"],
-        "pro": ["gpt-4o", "gpt-4o-mini", "claude-3-sonnet", "qwen-plus", "deepseek-chat"],
-        "enterprise": ["gpt-4o", "gpt-4-turbo", "claude-3-opus", "claude-3-sonnet", "qwen-max", "deepseek-chat"],
+        "pro": [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "claude-3-sonnet",
+            "qwen-plus",
+            "deepseek-chat",
+        ],
+        "enterprise": [
+            "gpt-4o",
+            "gpt-4-turbo",
+            "claude-3-opus",
+            "claude-3-sonnet",
+            "qwen-max",
+            "deepseek-chat",
+        ],
     }
 
     models = default_models.get(plan, default_models["standard"])
-    return ApiResponse(data=[
-        ModelAccessOut(model_id=m, is_enabled=True) for m in models
-    ])
+    return ApiResponse(
+        data=[
+            TenantAvailableModel(
+                name=m,
+                provider="default",
+                display_name=None,
+                status="available",
+                quota_remaining=None,
+                purposes=["llm", "chat"],
+                model_id=m,
+                is_enabled=True,
+            )
+            for m in models
+        ]
+    )
 
 
 @router.get(

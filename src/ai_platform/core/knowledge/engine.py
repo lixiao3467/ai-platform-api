@@ -35,8 +35,13 @@ class KnowledgeEngine:
     Query:  question → embed → vector search → rerank → return chunks
     """
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        tenant_id: uuid.UUID | None = None,
+    ) -> None:
         self._db = session
+        self._tenant_id = tenant_id
         self._chunker = RecursiveChunker(chunk_size=512, chunk_overlap=64)
 
     async def ingest_document(
@@ -80,10 +85,10 @@ class KnowledgeEngine:
         })
 
         # 3. Generate embeddings and store in Milvus
-        from ai_platform.core.knowledge.embeddings.embedder import get_embedder
+        from ai_platform.core.knowledge.embeddings.embedder import create_embedder
         from ai_platform.core.knowledge.store.milvus_store import get_milvus_store
 
-        embedder = get_embedder()
+        embedder = await create_embedder(self._tenant_id, self._db)
         milvus = await get_milvus_store(kb.collection_name, kb.embedding_model)
 
         # Batch embedding for efficiency
@@ -154,10 +159,10 @@ class KnowledgeEngine:
         3. Filter by score threshold
         4. Return ranked chunks
         """
-        from ai_platform.core.knowledge.embeddings.embedder import get_embedder
+        from ai_platform.core.knowledge.embeddings.embedder import create_embedder
         from ai_platform.core.knowledge.store.milvus_store import get_milvus_store
 
-        embedder = get_embedder()
+        embedder = await create_embedder(self._tenant_id, self._db)
         query_embedding = await embedder.embed(question)
 
         all_results = []
