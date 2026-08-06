@@ -17,7 +17,9 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import (
@@ -82,15 +84,21 @@ class App(Base):
 
 class ApiKey(Base):
     __tablename__ = "api_keys"
+    __table_args__ = (
+        # Composite index for fast API-key lookups (hot path in verify_api_key)
+        Index("idx_api_key_hash_prefix", "key_hash", "key_prefix"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     app_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("apps.id"), nullable=False
     )
     key_prefix: Mapped[str] = mapped_column(String(12), nullable=False)
-    key_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    # SHA-256 hex digest = 64 chars; sized to match, not over-allocate
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str | None] = mapped_column(String(64))
-    permissions: Mapped[dict] = mapped_column(JSON, default=list)
+    # Permissions list (matches default=list)
+    permissions: Mapped[list] = mapped_column(JSON, default=list)
     rate_limit: Mapped[int] = mapped_column(Integer, default=1000)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -107,6 +115,10 @@ class ApiKey(Base):
 
 class Conversation(Base):
     __tablename__ = "conversations"
+    __table_args__ = (
+        Index("idx_conv_tenant", "tenant_id"),
+        Index("idx_conv_app", "app_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     app_id: Mapped[uuid.UUID] = mapped_column(
@@ -159,6 +171,38 @@ class Message(Base):
 # =============================================================================
 
 
+class KnowledgeGroup(Base):
+    __tablename__ = "knowledge_groups"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_kg_tenant_name"),
+        Index("idx_kg_tenant", "tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    )
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("knowledge_groups.id"), nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    icon: Mapped[str | None] = mapped_column(String(64))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    tenant: Mapped[Tenant] = relationship("Tenant")
+    parent: Mapped[KnowledgeGroup | None] = relationship(
+        "KnowledgeGroup", remote_side=[id], backref="children"
+    )
+    knowledge_bases: Mapped[list[KnowledgeBase]] = relationship(
+        "KnowledgeBase", back_populates="group"
+    )
+
+
 class KnowledgeBase(Base):
     __tablename__ = "knowledge_bases"
 
@@ -168,6 +212,9 @@ class KnowledgeBase(Base):
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False
+    )
+    group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("knowledge_groups.id"), nullable=True
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
@@ -184,6 +231,7 @@ class KnowledgeBase(Base):
 
     app: Mapped[App] = relationship(back_populates="knowledge_bases")
     documents: Mapped[list[Document]] = relationship(back_populates="knowledge_base")
+    group: Mapped[KnowledgeGroup | None] = relationship("KnowledgeGroup", back_populates="knowledge_bases")
 
 
 class Document(Base):
@@ -198,6 +246,9 @@ class Document(Base):
     mime_type: Mapped[str | None] = mapped_column(String(64))
     file_size: Mapped[int | None] = mapped_column(BigInteger)
     storage_path: Mapped[str | None] = mapped_column(String(512))
+    file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    parse_result_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    processing_progress: Mapped[dict | None] = mapped_column(JSON, default=dict)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(16), default="pending")
     error_message: Mapped[str | None] = mapped_column(Text)
@@ -213,7 +264,10 @@ class Document(Base):
 
 class DocumentChunk(Base):
     __tablename__ = "document_chunks"
-    __table_args__ = (Index("idx_chunks_document", "document_id"),)
+    __table_args__ = (
+        Index("idx_chunks_document", "document_id"),
+        Index("idx_chunks_kb", "kb_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     document_id: Mapped[uuid.UUID] = mapped_column(
@@ -239,6 +293,10 @@ class DocumentChunk(Base):
 
 class Agent(Base):
     __tablename__ = "agents"
+    __table_args__ = (
+        Index("idx_agent_tenant", "tenant_id"),
+        Index("idx_agent_app", "app_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     app_id: Mapped[uuid.UUID] = mapped_column(
@@ -322,7 +380,11 @@ class Workflow(Base):
 
 class WorkflowExecution(Base):
     __tablename__ = "workflow_executions"
-    __table_args__ = (Index("idx_wf_exec_status", "status", "started_at"),)
+    __table_args__ = (
+        Index("idx_wf_exec_status", "status", "started_at"),
+        Index("idx_wf_exec_workflow", "workflow_id"),
+        Index("idx_wf_exec_tenant", "tenant_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     workflow_id: Mapped[uuid.UUID] = mapped_column(
@@ -348,6 +410,9 @@ class WorkflowExecution(Base):
 
 class WorkflowStep(Base):
     __tablename__ = "workflow_steps"
+    __table_args__ = (
+        Index("idx_wf_step_execution", "execution_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     execution_id: Mapped[uuid.UUID] = mapped_column(
@@ -490,13 +555,18 @@ role_permissions = Table(
 
 class User(Base):
     __tablename__ = "users"
-    __table_args__ = (Index("idx_users_tenant", "tenant_id"), Index("idx_users_email", "email", unique=True))
+    __table_args__ = (
+        Index("idx_users_tenant", "tenant_id"),
+        # Case-insensitive unique email index (PostgreSQL functional index)
+        Index("idx_users_email", text("lower(email)"), unique=True),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     username: Mapped[str] = mapped_column(String(64), nullable=False)
     email: Mapped[str] = mapped_column(String(128), nullable=False)
-    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    # Sized for argon2 hashes (up to ~500 chars with params); bcrypt fits in 60
+    password_hash: Mapped[str] = mapped_column(String(512), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(128))
     phone: Mapped[str | None] = mapped_column(String(20))
     avatar_url: Mapped[str | None] = mapped_column(String(512))
@@ -514,7 +584,11 @@ class User(Base):
 
 class Role(Base):
     __tablename__ = "roles"
-    __table_args__ = (Index("idx_roles_tenant", "tenant_id"),)
+    __table_args__ = (
+        Index("idx_roles_tenant", "tenant_id"),
+        # Ensure role codes are unique per tenant
+        UniqueConstraint("tenant_id", "code", name="uq_roles_tenant_code"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)

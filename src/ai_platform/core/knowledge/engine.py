@@ -68,8 +68,13 @@ class KnowledgeEngine:
             await self._db.flush()
             return 0
 
-        # 2. Chunk the text
-        chunks = self._chunker.chunk(text, metadata={
+        # 2. Chunk the text (use KB-specific config when available)
+        chunk_config = kb.chunk_config or {}
+        chunker = RecursiveChunker(
+            chunk_size=chunk_config.get("chunk_size", 512),
+            chunk_overlap=chunk_config.get("chunk_overlap", 64),
+        )
+        chunks = chunker.chunk(text, metadata={
             "document_id": str(document.id),
             "filename": document.filename,
         })
@@ -81,10 +86,12 @@ class KnowledgeEngine:
         embedder = get_embedder()
         milvus = await get_milvus_store(kb.collection_name, kb.embedding_model)
 
+        # Batch embedding for efficiency
+        texts = [c.content for c in chunks]
+        embeddings = await embedder.embed_batch(texts)
+
         chunk_records = []
-        for i, chunk in enumerate(chunks):
-            # Generate embedding
-            embedding = await embedder.embed(chunk.content)
+        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
 
             # Store in Milvus
             vector_id = f"{document.id}_{i}"

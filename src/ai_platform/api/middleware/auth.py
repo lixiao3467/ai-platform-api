@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -32,8 +33,6 @@ class _CacheEntry:
     expires_at: float  # time.monotonic()
 
     def is_alive(self) -> bool:
-        import time
-
         return time.monotonic() < self.expires_at
 
 
@@ -55,8 +54,6 @@ class _TTLCache:
         return entry.value
 
     def set(self, key: str, value: Any, ttl_s: float | None = None) -> None:
-        import time
-
         if len(self._store) >= self._maxsize and key not in self._store:
             # Evict oldest-expiring entry (very coarse — good enough for L1).
             oldest_key = min(
@@ -79,6 +76,9 @@ class _TTLCache:
 # Module-level L1 caches (permission + tenant status)
 _perm_cache = _TTLCache(maxsize=2000, default_ttl_s=60.0)
 _tenant_status_cache = _TTLCache(maxsize=500, default_ttl_s=30.0)
+
+# Sentinel value for negative API-key cache entries (key not found)
+_NEGATIVE_CACHE_SENTINEL = {"__not_found__": True}
 
 
 def _is_redis_error(exc: BaseException) -> bool:
@@ -122,6 +122,7 @@ class RequestContext:
     permissions: list[str] = field(default_factory=list)
     trace_id: str | None = None
     is_superadmin: bool = False
+    active_role: str | None = None
 
     @property
     def is_api_key_auth(self) -> bool:
@@ -167,8 +168,6 @@ def create_refresh_token(
     The refresh token carries a unique `jti` (JWT ID) that the server can
     revoke by adding it to a block-list in Redis.
     """
-    import uuid as _uuid
-
     settings = get_settings()
     now = datetime.now(tz=timezone.utc)
     payload = {
@@ -179,7 +178,7 @@ def create_refresh_token(
         "exp": now + timedelta(days=settings.jwt_refresh_expire_days),
         "iss": "ai-platform",
         "type": "refresh",
-        "jti": jti or str(_uuid.uuid4()),
+        "jti": jti or str(uuid.uuid4()),
     }
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
@@ -210,6 +209,8 @@ def decode_jwt_token(token: str) -> dict:
             options={
                 "verify_exp": True,
                 "verify_aud": False,  # No audience configured yet
+                "verify_iss": True,
+                "issuer": "ai-platform",
             },
         )
     except JWTError as e:
@@ -230,21 +231,28 @@ async def verify_api_key(raw_key: str) -> dict | None:
     """
     Verify an API key.
 
-    1. Check in-process L1 cache
-    2. Check Redis cache (prefix -> cached metadata)
-    3. If not cached, look up in database by prefix, verify hash
-    4. Cache result for 5 minutes (Redis best-effort; L1 as backup)
+    1. Reject malformed keys early
+    2. Check in-process L1 cache (including negative cache for invalid keys)
+    3. Check Redis cache (prefix -> cached metadata)
+    4. If not cached, look up in database by prefix, verify hash
+    5. Cache result for 5 minutes (Redis best-effort; L1 as backup)
 
     Returns key metadata dict or None if invalid.
     """
     import hashlib
 
+    # Reject malformed keys early (before any cache/DB lookup)
+    if not raw_key.startswith("aiplat_"):
+        return None
+
     prefix = raw_key[:8] if len(raw_key) >= 8 else raw_key
     cache_key = f"aip:key:{prefix}"
 
-    # L1: in-process cache
+    # L1: in-process cache (includes negative cache)
     l1_hit = _perm_cache.get(cache_key)
     if l1_hit is not None:
+        if isinstance(l1_hit, dict) and l1_hit.get("__not_found__"):
+            return None  # Negative cache hit — key was recently invalid
         return l1_hit
 
     # L2: Redis cache (degrade to DB on failure)
@@ -253,6 +261,10 @@ async def verify_api_key(raw_key: str) -> dict | None:
         cached = await redis.get(cache_key)
         if cached:
             metadata = json.loads(cached)
+            # Check for negative cache sentinel in Redis too
+            if isinstance(metadata, dict) and metadata.get("__not_found__"):
+                _perm_cache.set(cache_key, _NEGATIVE_CACHE_SENTINEL, ttl_s=30.0)
+                return None
             _perm_cache.set(cache_key, metadata, ttl_s=300.0)
             return metadata
     except Exception as exc:
@@ -261,12 +273,8 @@ async def verify_api_key(raw_key: str) -> dict | None:
         else:
             raise
 
-    # Reject malformed keys early
-    if not raw_key.startswith("aiplat_"):
-        return None
-
     # L3: Real DB lookup by key_hash
-    from sqlalchemy import select, update
+    from sqlalchemy import select
 
     from ai_platform.domain.models import ApiKey
     from ai_platform.infra.database.connection import get_session_factory
@@ -283,28 +291,34 @@ async def verify_api_key(raw_key: str) -> dict | None:
         api_key_obj = result.scalars().first()
 
         if not api_key_obj:
+            # Cache negative result for 30s to prevent DB-DoS from invalid keys
+            _perm_cache.set(cache_key, _NEGATIVE_CACHE_SENTINEL, ttl_s=30.0)
             return None
 
         # Check is_enabled
         if not getattr(api_key_obj, "is_enabled", True):
+            _perm_cache.set(cache_key, _NEGATIVE_CACHE_SENTINEL, ttl_s=30.0)
             return None
 
         # Check expiry
         if api_key_obj.expires_at:
             now = datetime.now(tz=timezone.utc)
             expires = api_key_obj.expires_at
-            if expires.tzinfo is None:
-                from datetime import timezone as _tz
-                expires = expires.replace(tzinfo=_tz.utc)
-            if expires < now:
+            if isinstance(expires, datetime) and expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            if isinstance(expires, datetime) and expires < now:
+                _perm_cache.set(cache_key, _NEGATIVE_CACHE_SENTINEL, ttl_s=30.0)
                 return None
 
-        # Touch last_used_at (best-effort, do not fail on error)
+        # Touch last_used_at in a dedicated transaction (best-effort)
         try:
-            await session.execute(
-                update(ApiKey).where(ApiKey.id == api_key_obj.id).values(last_used_at=datetime.now(tz=timezone.utc))
-            )
-            await session.commit()
+            from sqlalchemy import update
+            async with factory(begin=True) as touch_session:
+                await touch_session.execute(
+                    update(ApiKey).where(ApiKey.id == api_key_obj.id).values(
+                        last_used_at=datetime.now(tz=timezone.utc)
+                    )
+                )
         except Exception:
             logger.debug("Failed to update last_used_at for API key", exc_info=True)
 
@@ -355,16 +369,23 @@ async def _load_user_permissions(user_id: str, tenant_id: uuid.UUID) -> tuple[li
     from sqlalchemy import select
     from sqlalchemy.orm import selectinload
 
-    from ai_platform.domain.models import User
+    from ai_platform.domain.models import Role, User
     from ai_platform.infra.database.connection import get_session_factory
+
+    # Validate user_id is a valid UUID before DB query
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except (ValueError, AttributeError):
+        logger.warning("Invalid user_id format in JWT", user_id=user_id)
+        return [], False
 
     factory = get_session_factory()
     async with factory() as session:
         stmt = (
             select(User)
-            .where(User.id == uuid.UUID(user_id), User.tenant_id == tenant_id)
+            .where(User.id == user_uuid, User.tenant_id == tenant_id)
             .options(
-                selectinload(User.roles).selectinload(__import__("ai_platform.domain.models", fromlist=["Role"]).Role.permissions)
+                selectinload(User.roles).selectinload(Role.permissions)
             )
         )
         result = await session.execute(stmt)
@@ -385,6 +406,32 @@ async def _load_user_permissions(user_id: str, tenant_id: uuid.UUID) -> tuple[li
                 perm_set.add(perm_str)
 
         return list(perm_set), False
+
+
+async def _get_role_permissions(role_code: str, tenant_id: uuid.UUID) -> list[str] | None:
+    """Load permission strings for a single role (identified by code + tenant).
+
+    Returns None when no matching role is found so the caller can decide how
+    to degrade (we fall back to the user's full permission set).
+    """
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    from ai_platform.domain.models import Role
+    from ai_platform.infra.database.connection import get_session_factory
+
+    factory = get_session_factory()
+    async with factory() as session:
+        stmt = (
+            select(Role)
+            .where(Role.code == role_code, Role.tenant_id == tenant_id)
+            .options(selectinload(Role.permissions))
+        )
+        result = await session.execute(stmt)
+        role = result.scalars().first()
+        if not role:
+            return None
+        return [f"{p.resource}.{p.action}" for p in role.permissions]
 
 
 async def _check_tenant_status(tenant_id: uuid.UUID) -> str:
@@ -506,7 +553,15 @@ async def get_request_context(request: Request) -> RequestContext:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid API key",
             )
-        tenant_id = uuid.UUID(key_meta["tenant_id"])
+        # Validate tenant_id format (prevent 500 on malformed data)
+        try:
+            tenant_id = uuid.UUID(key_meta["tenant_id"])
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.warning("Invalid tenant_id in API key metadata", error=str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid API key configuration",
+            )
 
         # Check tenant status
         await _check_tenant_status(tenant_id)
@@ -526,7 +581,17 @@ async def get_request_context(request: Request) -> RequestContext:
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
         payload = decode_jwt_token(token)
-        tenant_id = uuid.UUID(payload["tenant_id"])
+
+        # Validate tenant_id format (prevent 500 on malformed JWT claims)
+        try:
+            tenant_id = uuid.UUID(payload["tenant_id"])
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.warning("Invalid tenant_id in JWT payload", error=str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token claims",
+            )
+
         user_id = payload.get("sub")
 
         # Check tenant status
@@ -535,9 +600,24 @@ async def get_request_context(request: Request) -> RequestContext:
         # Load user permissions from DB (with caching)
         permissions: list[str] = []
         is_superadmin = False
+        active_role: str | None = None
 
         if user_id:
-            perm_cache_key = f"aip:user_perms:{user_id}"
+            # Determine active role selection (stored in Redis)
+            try:
+                redis = await get_redis()
+                active_role = await redis.get(f"aip:user:{user_id}:active_role")
+            except Exception as exc:
+                if _is_redis_error(exc):
+                    _redis_unavailable(exc, context="get_request_context:active_role")
+                    # Fail open for active_role — user keeps full permissions
+                else:
+                    raise
+
+            # Cache key includes active_role so different role selections
+            # get their own L1 cache entry.
+            role_suffix = f":{active_role}" if active_role else ""
+            perm_cache_key = f"aip:user_perms:{user_id}{role_suffix}"
 
             # L1: in-process cache
             l1_hit = _perm_cache.get(perm_cache_key)
@@ -559,8 +639,28 @@ async def get_request_context(request: Request) -> RequestContext:
                         raise
 
             if perm_data is None:
-                # L3: DB
+                # L3: DB — always loads the FULL permission set across all roles
                 permissions, is_superadmin = await _load_user_permissions(user_id, tenant_id)
+
+                # If an active role is selected, scope permissions to that role
+                if active_role and not is_superadmin:
+                    role_perms = await _get_role_permissions(active_role, tenant_id)
+                    if role_perms is not None:
+                        # Intersect: only permissions the role has AND user has
+                        full_set = set(permissions)
+                        permissions = [p for p in role_perms if p in full_set]
+                    else:
+                        # Role not found — deny access (fail closed, not open)
+                        logger.warning(
+                            "Active role not found, denying access",
+                            user_id=user_id,
+                            active_role=active_role,
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            detail=f"Role '{active_role}' not found. Please switch to a valid role.",
+                        )
+
                 perm_data = {"permissions": permissions, "is_superadmin": is_superadmin}
                 _perm_cache.set(perm_cache_key, perm_data, ttl_s=300.0)
                 # Best-effort Redis populate
@@ -582,6 +682,7 @@ async def get_request_context(request: Request) -> RequestContext:
             permissions=permissions,
             trace_id=trace_id,
             is_superadmin=is_superadmin,
+            active_role=active_role,
         )
         request.state.auth_context = ctx
         return ctx
@@ -594,8 +695,15 @@ async def get_request_context(request: Request) -> RequestContext:
 
 
 async def optional_auth(request: Request) -> RequestContext | None:
-    """Optional authentication — returns None if no auth provided."""
+    """Optional authentication — returns None if no auth provided.
+
+    Only swallows 401 (missing/invalid credentials). Other errors like
+    403 (tenant suspended) are re-raised.
+    """
     try:
         return await get_request_context(request)
-    except HTTPException:
-        return None
+    except HTTPException as exc:
+        # Only swallow 401 (missing auth); re-raise 403 (tenant suspended) etc.
+        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+            return None
+        raise

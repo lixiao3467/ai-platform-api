@@ -235,6 +235,9 @@ class AppSettings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
 
+    # --- Vision (OCR via multimodal LLM) ---
+    vision_model: str = "gpt-4o"
+
     # --- Milvus (Zilliz Cloud) ---
     milvus_uri: str = "http://localhost:19530"
     milvus_token: str = ""
@@ -247,6 +250,9 @@ class AppSettings(BaseSettings):
     minio_access_key: str = "minioadmin"
     minio_secret_key: str = "minioadmin"
     minio_bucket: str = "ai-platform"
+
+    # --- Storage (local file storage for document uploads) ---
+    storage_path: str = "storage"
 
     # --- Langfuse ---
     langfuse_public_key: str = ""

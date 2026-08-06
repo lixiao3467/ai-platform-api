@@ -21,6 +21,11 @@ from ai_platform.api.v1 import knowledge  # noqa: E402
 
 api_router.include_router(knowledge.router, prefix="/knowledge-bases", tags=["knowledge"])
 
+# --- Knowledge Groups ---
+from ai_platform.api.v1 import knowledge_groups  # noqa: E402
+
+api_router.include_router(knowledge_groups.router, prefix="/knowledge-groups", tags=["知识库分组"])
+
 # --- Agents ---
 from ai_platform.api.v1 import agents  # noqa: E402
 
@@ -73,12 +78,18 @@ api_router.include_router(metrics_api.router, prefix="/metrics", tags=["metrics"
 
 # --- Users & Roles (RBAC) ---
 from ai_platform.api.v1 import users as users_module  # noqa: E402
+from ai_platform.api.v1 import auth as auth_module  # noqa: E402
 
 api_router.include_router(users_module.users_router, prefix="/users", tags=["users"])
 api_router.include_router(users_module.roles_router, prefix="/roles", tags=["roles"])
-api_router.include_router(users_module.auth_router, prefix="/auth", tags=["auth"])
+api_router.include_router(auth_module.auth_router, prefix="/auth", tags=["auth"])
 
 # --- Tenant Self-Service ---
 from ai_platform.api.v1 import tenant_self  # noqa: E402
 
 api_router.include_router(tenant_self.router, prefix="/tenant", tags=["tenant"])
+
+# --- Tenant Management (super-admin CRUD) ---
+from ai_platform.api.v1 import tenants  # noqa: E402
+
+api_router.include_router(tenants.router, prefix="/tenants", tags=["租户管理"])

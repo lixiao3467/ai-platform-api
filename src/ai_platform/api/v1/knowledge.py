@@ -2,23 +2,36 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import re
 import uuid
+from pathlib import Path
 
+import structlog
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
 from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.chat import ChatCompletionRequest, ChatMessage
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
+from ai_platform.config import get_settings
+from ai_platform.core.knowledge.chunkers.recursive import RecursiveChunker
 from ai_platform.core.knowledge.engine import KnowledgeEngine
+from ai_platform.core.knowledge.parsers.base import parse_document
 from ai_platform.core.model_router.litellm_client import get_llm_client
-from ai_platform.domain.models import Document, KnowledgeBase
-from ai_platform.infra.database.connection import get_db
+from ai_platform.domain.models import Document, DocumentChunk, KnowledgeBase, KnowledgeGroup
+from ai_platform.infra.database.connection import get_db, get_session_factory
+
+logger = structlog.get_logger()
 
 router = APIRouter()
+
+# Keep strong references to background tasks so they aren't GC'd mid-run.
+_background_tasks: set[asyncio.Task] = set()
 
 
 # =============================================================================
@@ -32,6 +45,7 @@ class KBCreateRequest(BaseModel):
     embedding_model: str = Field(default="text-embedding-3-small", max_length=100)
     chunk_size: int = Field(default=512, ge=100, le=2000)
     chunk_overlap: int = Field(default=64, ge=0, le=500)
+    group_id: str | None = Field(default=None, description="知识库分组 ID")
 
     @classmethod
     def validate_name(cls, v: str) -> str:
@@ -51,6 +65,7 @@ class KBOut(BaseModel):
     doc_count: int
     chunk_count: int
     status: str
+    group_id: str | None
     created_at: str
 
 
@@ -62,6 +77,9 @@ class DocOut(BaseModel):
     chunk_count: int
     status: str
     error_message: str | None
+    file_hash: str | None = None
+    parse_result_path: str | None = None
+    processing_progress: dict | None = None
     created_at: str
 
 
@@ -81,6 +99,168 @@ class RetrievedChunkOut(BaseModel):
 
 
 # =============================================================================
+# Helpers
+# =============================================================================
+
+
+def _doc_to_out(doc: Document) -> DocOut:
+    """Build a DocOut from a Document ORM instance."""
+    return DocOut(
+        id=doc.id,
+        filename=doc.filename,
+        mime_type=doc.mime_type,
+        file_size=doc.file_size,
+        chunk_count=doc.chunk_count or 0,
+        status=doc.status or "pending",
+        error_message=doc.error_message,
+        file_hash=doc.file_hash,
+        parse_result_path=doc.parse_result_path,
+        processing_progress=doc.processing_progress,
+        created_at=doc.created_at.isoformat(),
+    )
+
+
+def _cleanup_document_files(doc: Document) -> None:
+    """Remove raw file and parse-result cache from disk (best-effort)."""
+    for path_str in (doc.storage_path, doc.parse_result_path):
+        if not path_str:
+            continue
+        try:
+            p = Path(path_str)
+            if p.exists():
+                p.unlink()
+        except Exception as e:
+            logger.warning("Failed to cleanup document file", path=path_str, error=str(e))
+
+
+async def _process_document(
+    doc_id: uuid.UUID,
+    kb_id: uuid.UUID,
+    content: bytes,
+    filename: str,
+    mime_type: str,
+) -> None:
+    """Background task: parse → chunk → embed → store.
+
+    Runs outside the request lifecycle with its own DB session.
+    """
+    factory = get_session_factory()
+    async with factory() as db:
+        doc = await db.get(Document, doc_id)
+        kb = await db.get(KnowledgeBase, kb_id)
+        if not doc or not kb:
+            logger.error("Background task: doc/kb not found", doc_id=str(doc_id), kb_id=str(kb_id))
+            return
+
+        try:
+            # --- Parse ---
+            doc.processing_progress = {"stage": "parsing", "percent": 10, "message": "解析文档中..."}
+            await db.commit()
+
+            text = await parse_document(content, mime_type)
+            if not text.strip():
+                raise RuntimeError("Document is empty after parsing")
+
+            # Persist parsed markdown cache
+            parse_result_path = Path(doc.storage_path).with_suffix(".md") if doc.storage_path else None
+            if parse_result_path:
+                parse_result_path.parent.mkdir(parents=True, exist_ok=True)
+                parse_result_path.write_text(text, encoding="utf-8")
+                doc.parse_result_path = str(parse_result_path)
+
+            doc.processing_progress = {"stage": "chunking", "percent": 30, "message": "分块中..."}
+            await db.commit()
+
+            # --- Chunk (use KB config) ---
+            chunk_config = kb.chunk_config or {}
+            chunker = RecursiveChunker(
+                chunk_size=chunk_config.get("chunk_size", 512),
+                chunk_overlap=chunk_config.get("chunk_overlap", 64),
+            )
+            chunks = chunker.chunk(text, metadata={"document_id": str(doc.id), "filename": filename})
+
+            doc.processing_progress = {
+                "stage": "embedding",
+                "percent": 50,
+                "message": f"向量化中 (0/{len(chunks)})...",
+            }
+            await db.commit()
+
+            # --- Embed (batch) + Store ---
+            from ai_platform.core.knowledge.embeddings.embedder import get_embedder
+            from ai_platform.core.knowledge.store.milvus_store import get_milvus_store
+
+            embedder = get_embedder()
+            milvus = await get_milvus_store(kb.collection_name, kb.embedding_model)
+
+            texts = [c.content for c in chunks]
+            embeddings = await embedder.embed_batch(texts)
+
+            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                vector_id = f"{doc.id}_{chunk.metadata.get('chunk_index', i)}"
+                await milvus.insert(
+                    collection_name=kb.collection_name,
+                    vector_id=vector_id,
+                    embedding=embedding,
+                    metadata={
+                        "chunk_id": str(uuid.uuid4()),
+                        "document_id": str(doc.id),
+                        "kb_id": str(kb.id),
+                        "chunk_index": chunk.metadata.get("chunk_index", i),
+                        "content": chunk.content,
+                    },
+                )
+
+                db_chunk = DocumentChunk(
+                    id=uuid.uuid4(),
+                    document_id=doc.id,
+                    kb_id=kb.id,
+                    content=chunk.content,
+                    chunk_index=chunk.metadata.get("chunk_index", i),
+                    token_count=len(chunk.content) // 4,
+                    metadata_=chunk.metadata,
+                    vector_id=vector_id,
+                )
+                db.add(db_chunk)
+
+                # Progress update every chunk, commit every 10
+                percent = 50 + int(40 * (i + 1) / len(chunks))
+                doc.processing_progress = {
+                    "stage": "embedding",
+                    "percent": percent,
+                    "message": f"向量化中 ({i + 1}/{len(chunks)})...",
+                }
+                if (i + 1) % 10 == 0:
+                    await db.commit()
+
+            # --- Finalize ---
+            doc.status = "ready"
+            doc.chunk_count = len(chunks)
+            doc.processing_progress = {"stage": "completed", "percent": 100, "message": "处理完成"}
+            doc.error_message = None
+
+            # Atomic counter update (avoids read-modify-write race)
+            await db.execute(
+                sa_update(KnowledgeBase)
+                .where(KnowledgeBase.id == kb.id)
+                .values(
+                    doc_count=KnowledgeBase.doc_count + 1,
+                    chunk_count=KnowledgeBase.chunk_count + len(chunks),
+                )
+            )
+
+            await db.commit()
+            logger.info("Document processed", doc_id=str(doc.id), chunks=len(chunks))
+
+        except Exception as e:
+            logger.exception("Document processing failed", doc_id=str(doc_id))
+            doc.status = "failed"
+            doc.error_message = str(e)[:2000]
+            doc.processing_progress = {"stage": "failed", "percent": 0, "message": f"处理失败: {str(e)[:200]}"}
+            await db.commit()
+
+
+# =============================================================================
 # Knowledge Base CRUD
 # =============================================================================
 
@@ -94,10 +274,19 @@ async def create_knowledge_base(
     """Create a new knowledge base."""
     collection_name = f"kb_{uuid.uuid4().hex[:12]}"
 
+    # Validate group_id if provided
+    group_id_uuid = None
+    if req.group_id:
+        group_id_uuid = uuid.UUID(req.group_id)
+        group = await session.get(KnowledgeGroup, group_id_uuid)
+        if not group or group.tenant_id != ctx.tenant_id:
+            raise HTTPException(status_code=404, detail="知识库分组不存在")
+
     kb = KnowledgeBase(
         id=uuid.uuid4(),
         app_id=ctx.app_id or uuid.UUID("00000000-0000-0000-0000-000000000001"),
         tenant_id=ctx.tenant_id,
+        group_id=group_id_uuid,
         name=req.name,
         description=req.description,
         embedding_model=req.embedding_model,
@@ -110,7 +299,8 @@ async def create_knowledge_base(
     return ApiResponse(data=KBOut(
         id=kb.id, name=kb.name, description=kb.description,
         embedding_model=kb.embedding_model, doc_count=0, chunk_count=0,
-        status=kb.status, created_at=kb.created_at.isoformat(),
+        status=kb.status, group_id=str(kb.group_id) if kb.group_id else None,
+        created_at=kb.created_at.isoformat(),
     ))
 
 
@@ -118,14 +308,21 @@ async def create_knowledge_base(
 async def list_knowledge_bases(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
+    group_id: str | None = Query(default=None, description="按分组过滤"),
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """List knowledge bases for the current tenant."""
     offset = (page - 1) * page_size
+
+    conditions = [KnowledgeBase.tenant_id == ctx.tenant_id]
+    if group_id:
+        group_uuid = uuid.UUID(group_id)
+        conditions.append(KnowledgeBase.group_id == group_uuid)
+
     query = (
         select(KnowledgeBase)
-        .where(KnowledgeBase.tenant_id == ctx.tenant_id)
+        .where(*conditions)
         .order_by(KnowledgeBase.created_at.desc())
         .offset(offset).limit(page_size)
     )
@@ -133,13 +330,14 @@ async def list_knowledge_bases(
     kbs = result.scalars().all()
 
     total = (await session.execute(
-        select(func.count()).select_from(KnowledgeBase).where(KnowledgeBase.tenant_id == ctx.tenant_id)
+        select(func.count()).select_from(KnowledgeBase).where(*conditions)
     )).scalar() or 0
 
     items = [
         KBOut(id=kb.id, name=kb.name, description=kb.description,
               embedding_model=kb.embedding_model, doc_count=kb.doc_count,
               chunk_count=kb.chunk_count, status=kb.status,
+              group_id=str(kb.group_id) if kb.group_id else None,
               created_at=kb.created_at.isoformat())
         for kb in kbs
     ]
@@ -160,6 +358,7 @@ async def get_knowledge_base(
         id=kb.id, name=kb.name, description=kb.description,
         embedding_model=kb.embedding_model, doc_count=kb.doc_count,
         chunk_count=kb.chunk_count, status=kb.status,
+        group_id=str(kb.group_id) if kb.group_id else None,
         created_at=kb.created_at.isoformat(),
     ))
 
@@ -175,7 +374,19 @@ async def delete_knowledge_base(
     if not kb or kb.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
 
-    # TODO: Delete Milvus collection
+    # Clean up Milvus collection first
+    try:
+        from ai_platform.core.knowledge.store.milvus_store import get_milvus_store
+        store = await get_milvus_store(kb.collection_name, kb.embedding_model)
+        await store.delete_collection(kb.collection_name)
+    except Exception as e:
+        logger.warning("Milvus cleanup failed during KB delete", kb_id=str(kb_id), error=str(e))
+
+    # Clean up stored files for all documents in this KB
+    docs_result = await session.execute(select(Document).where(Document.kb_id == kb_id))
+    for doc in docs_result.scalars().all():
+        _cleanup_document_files(doc)
+
     await session.delete(kb)
     return ApiResponse(message="Knowledge base deleted")
 
@@ -192,35 +403,65 @@ async def upload_document(
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
-    """Upload and ingest a document into the knowledge base."""
+    """Upload a document. Processing happens in the background."""
     kb = await session.get(KnowledgeBase, kb_id)
     if not kb or kb.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
 
+    # 1. Read file content (with size limit to avoid OOM)
+    MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
     content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"文件过大，最大 {MAX_UPLOAD_SIZE // 1024 // 1024}MB",
+        )
 
-    # Create document record
+    # 2. Compute file hash (dedup)
+    file_hash = hashlib.sha256(content).hexdigest()
+
+    # 3. Persist raw file to disk (sanitize filename to prevent path traversal)
+    settings = get_settings()
+    storage_dir = Path(settings.storage_path) / "documents" / str(ctx.tenant_id)
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    doc_id = uuid.uuid4()
+    safe_filename = re.sub(r'[^\w\s\-.]', '_', file.filename or 'unknown')
+    safe_filename = safe_filename.strip()[:200]
+    if not safe_filename:
+        safe_filename = 'unknown'
+    storage_path = storage_dir / f"{doc_id}_{safe_filename}"
+    storage_path.write_bytes(content)
+
+    # 4. Create Document record (status=processing)
     doc = Document(
-        id=uuid.uuid4(),
+        id=doc_id,
         kb_id=kb.id,
         filename=file.filename or "unknown",
         mime_type=file.content_type or "text/plain",
         file_size=len(content),
+        storage_path=str(storage_path),
+        file_hash=file_hash,
         status="processing",
+        processing_progress={"stage": "queued", "percent": 0, "message": "等待处理"},
     )
     session.add(doc)
     await session.flush()
+    await session.refresh(doc)
 
-    # Ingest document (parse → chunk → embed → store)
-    engine = KnowledgeEngine(session)
-    chunk_count = await engine.ingest_document(doc, content, kb)
+    # Commit BEFORE launching the task so the background session can see the row
+    await session.commit()
 
-    return ApiResponse(data=DocOut(
-        id=doc.id, filename=doc.filename, mime_type=doc.mime_type,
-        file_size=doc.file_size, chunk_count=chunk_count,
-        status=doc.status, error_message=doc.error_message,
-        created_at=doc.created_at.isoformat(),
-    ))
+    # 5. Kick off background processing (own DB session)
+    task = asyncio.create_task(
+        _process_document(doc.id, kb.id, content, doc.filename, doc.mime_type or "text/plain")
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    # 6. Return immediately
+    return ApiResponse(data=_doc_to_out(doc))
 
 
 @router.get("/{kb_id}/documents", response_model=ApiResponse[list[DocOut]], dependencies=[Depends(require_permission("knowledge.read"))])
@@ -238,14 +479,152 @@ async def list_documents(
     result = await session.execute(stmt)
     docs = result.scalars().all()
 
-    items = [
-        DocOut(id=d.id, filename=d.filename, mime_type=d.mime_type,
-               file_size=d.file_size, chunk_count=d.chunk_count,
-               status=d.status, error_message=d.error_message,
-               created_at=d.created_at.isoformat())
-        for d in docs
-    ]
-    return ApiResponse(data=items)
+    return ApiResponse(data=[_doc_to_out(d) for d in docs])
+
+
+@router.get("/{kb_id}/documents/{doc_id}", response_model=ApiResponse[DocOut], dependencies=[Depends(require_permission("knowledge.read"))])
+async def get_document(
+    kb_id: uuid.UUID,
+    doc_id: uuid.UUID,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """Get document details including processing progress."""
+    kb = await session.get(KnowledgeBase, kb_id)
+    if not kb or kb.tenant_id != ctx.tenant_id:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
+
+    doc = await session.get(Document, doc_id)
+    if not doc or doc.kb_id != kb_id:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return ApiResponse(data=_doc_to_out(doc))
+
+
+@router.post("/{kb_id}/documents/{doc_id}/retry", response_model=ApiResponse[DocOut], dependencies=[Depends(require_permission("knowledge.write"))])
+async def retry_document(
+    kb_id: uuid.UUID,
+    doc_id: uuid.UUID,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """Retry processing a failed document."""
+    kb = await session.get(KnowledgeBase, kb_id)
+    if not kb or kb.tenant_id != ctx.tenant_id:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
+
+    doc = await session.get(Document, doc_id)
+    if not doc or doc.kb_id != kb_id:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    if doc.status != "failed":
+        raise HTTPException(status_code=400, detail="Only failed documents can be retried")
+
+    if not doc.storage_path or not Path(doc.storage_path).exists():
+        raise HTTPException(status_code=400, detail="Original file not found on disk; cannot retry")
+
+    # Count old chunks so we can decrement KB counters accurately
+    old_chunks_result = await session.execute(
+        select(DocumentChunk).where(DocumentChunk.document_id == doc.id)
+    )
+    old_chunks = old_chunks_result.scalars().all()
+    old_chunk_count = len(old_chunks)
+
+    # Delete old PG chunk records
+    for chunk in old_chunks:
+        await session.delete(chunk)
+
+    # Clean up old vectors in Milvus (best-effort)
+    try:
+        from ai_platform.core.knowledge.store.milvus_store import get_milvus_store
+        store = await get_milvus_store(kb.collection_name, kb.embedding_model)
+        await store.delete_by_filter(kb.collection_name, f'document_id == "{str(doc.id)}"')
+    except Exception as e:
+        logger.warning("Failed to clean old vectors during retry", doc_id=str(doc.id), error=str(e))
+
+    # Decrement KB counters atomically (old counts will be re-added after re-processing)
+    await session.execute(
+        sa_update(KnowledgeBase)
+        .where(KnowledgeBase.id == kb.id)
+        .values(
+            doc_count=func.greatest(KnowledgeBase.doc_count - 1, 0),
+            chunk_count=func.greatest(KnowledgeBase.chunk_count - old_chunk_count, 0),
+        )
+    )
+
+    # Read file from disk and reset status
+    content = Path(doc.storage_path).read_bytes()
+    doc.status = "processing"
+    doc.error_message = None
+    doc.processing_progress = {"stage": "queued", "percent": 0, "message": "重新处理中..."}
+    doc.chunk_count = 0
+    await session.flush()
+    await session.refresh(doc)
+
+    # Commit BEFORE launching the task
+    await session.commit()
+
+    task = asyncio.create_task(
+        _process_document(doc.id, kb.id, content, doc.filename, doc.mime_type or "text/plain")
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    return ApiResponse(data=_doc_to_out(doc))
+
+
+@router.delete("/{kb_id}/documents/{doc_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("knowledge.write"))])
+async def delete_document(
+    kb_id: uuid.UUID,
+    doc_id: uuid.UUID,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """Delete a document, its chunks, and its vectors."""
+    kb = await session.get(KnowledgeBase, kb_id)
+    if not kb or kb.tenant_id != ctx.tenant_id:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
+
+    doc = await session.get(Document, doc_id)
+    if not doc or doc.kb_id != kb_id:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # 1. Remove vectors from Milvus
+    try:
+        from ai_platform.core.knowledge.store.milvus_store import get_milvus_store
+        store = await get_milvus_store(kb.collection_name, kb.embedding_model)
+        await store.delete_by_filter(kb.collection_name, f'document_id == "{str(doc.id)}"')
+    except Exception as e:
+        logger.warning("Milvus delete failed", doc_id=str(doc.id), error=str(e))
+
+    # 2. Compute chunk count to update KB stats
+    removed_chunks = doc.chunk_count or 0
+
+    # 3. Delete PG chunk records
+    chunks_result = await session.execute(
+        select(DocumentChunk).where(DocumentChunk.document_id == doc.id)
+    )
+    for chunk in chunks_result.scalars().all():
+        await session.delete(chunk)
+
+    # 4. Delete document record
+    await session.delete(doc)
+
+    # 5. Update KB counts atomically
+    await session.execute(
+        sa_update(KnowledgeBase)
+        .where(KnowledgeBase.id == kb.id)
+        .values(
+            doc_count=func.greatest(KnowledgeBase.doc_count - 1, 0),
+            chunk_count=func.greatest(KnowledgeBase.chunk_count - removed_chunks, 0),
+        )
+    )
+
+    # 6. Cleanup files
+    await session.flush()
+    _cleanup_document_files(doc)
+
+    return ApiResponse(message="Document deleted")
 
 
 # =============================================================================

@@ -150,6 +150,21 @@ class MilvusStore:
             await asyncio.to_thread(client.drop_collection, collection_name)
             logger.info("Dropped Milvus collection", name=collection_name)
 
+    async def delete_by_filter(self, collection_name: str, filter_expr: str) -> int:
+        """Delete vectors matching a filter expression. Returns the count deleted."""
+        client = await self._get_client()
+        has = await asyncio.to_thread(client.has_collection, collection_name)
+        if not has:
+            return 0
+
+        def _delete():
+            res = client.delete(collection_name=collection_name, filter=filter_expr)
+            return res.get("delete_count", 0) if isinstance(res, dict) else 0
+
+        count = await asyncio.to_thread(_delete)
+        logger.info("Deleted vectors from Milvus", collection=collection_name, filter=filter_expr, count=count)
+        return count
+
 
 _store_cache: dict[str, MilvusStore] = {}
 
