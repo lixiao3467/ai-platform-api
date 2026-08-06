@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import os
+import sys
 import uuid
+
+# Add src directory to Python path for test imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import pytest
 

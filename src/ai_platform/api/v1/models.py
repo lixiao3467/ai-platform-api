@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
+from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse
 from ai_platform.infra.database.connection import get_db
 from ai_platform.services.provider_service import ProviderService
@@ -73,7 +74,7 @@ class ProviderOut(BaseModel):
 # =============================================================================
 
 
-@router.post("/providers", response_model=ApiResponse[ProviderOut])
+@router.post("/providers", response_model=ApiResponse[ProviderOut], dependencies=[Depends(require_permission("model.manage"))])
 async def create_provider(
     req: ProviderCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -105,7 +106,7 @@ async def create_provider(
     return ApiResponse(data=ProviderOut(**provider_data))
 
 
-@router.get("/providers", response_model=ApiResponse[list[ProviderOut]])
+@router.get("/providers", response_model=ApiResponse[list[ProviderOut]], dependencies=[Depends(require_permission("model.read"))])
 async def list_providers(
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
@@ -116,7 +117,7 @@ async def list_providers(
     return ApiResponse(data=[ProviderOut(**p) for p in providers])
 
 
-@router.put("/providers/{provider_id}/key", response_model=ApiResponse)
+@router.put("/providers/{provider_id}/key", response_model=ApiResponse, dependencies=[Depends(require_permission("model.manage"))])
 async def update_provider_key(
     provider_id: uuid.UUID,
     req: ProviderUpdateKeyRequest,
@@ -132,7 +133,7 @@ async def update_provider_key(
     return ApiResponse(message="API key updated (encrypted)")
 
 
-@router.put("/providers/{provider_id}", response_model=ApiResponse[ProviderOut])
+@router.put("/providers/{provider_id}", response_model=ApiResponse[ProviderOut], dependencies=[Depends(require_permission("model.manage"))])
 async def update_provider(
     provider_id: uuid.UUID,
     req: ProviderUpdateRequest,
@@ -158,7 +159,7 @@ async def update_provider(
     return ApiResponse(data=ProviderOut(**provider_data))
 
 
-@router.put("/providers/{provider_id}/toggle", response_model=ApiResponse)
+@router.put("/providers/{provider_id}/toggle", response_model=ApiResponse, dependencies=[Depends(require_permission("model.manage"))])
 async def toggle_provider(
     provider_id: uuid.UUID,
     enabled: bool,
@@ -174,7 +175,7 @@ async def toggle_provider(
     return ApiResponse(message=f"Provider {'enabled' if enabled else 'disabled'}")
 
 
-@router.delete("/providers/{provider_id}", response_model=ApiResponse)
+@router.delete("/providers/{provider_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("model.manage"))])
 async def delete_provider(
     provider_id: uuid.UUID,
     ctx: RequestContext = Depends(get_request_context),
@@ -194,7 +195,7 @@ async def delete_provider(
 # =============================================================================
 
 
-@router.get("/", response_model=ApiResponse[list[dict]])
+@router.get("/", response_model=ApiResponse[list[dict]], dependencies=[Depends(require_permission("model.read"))])
 async def list_models(
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),

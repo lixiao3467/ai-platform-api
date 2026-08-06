@@ -5,10 +5,11 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
+from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse
 from ai_platform.core.evaluation.engine import (
     EvalDataset,
@@ -81,7 +82,7 @@ class EvalRunOut(BaseModel):
 # =============================================================================
 
 
-@router.post("/run", response_model=ApiResponse[EvalRunOut])
+@router.post("/run", response_model=ApiResponse[EvalRunOut], dependencies=[Depends(require_permission("evaluation.manage"))])
 async def run_evaluation(
     req: EvalRunRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -142,7 +143,7 @@ async def run_evaluation(
     ))
 
 
-@router.post("/judge", response_model=ApiResponse)
+@router.post("/judge", response_model=ApiResponse, dependencies=[Depends(require_permission("evaluation.manage"))])
 async def judge_single(
     req: JudgeSingleRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -159,3 +160,32 @@ async def judge_single(
             for m in metrics
         ],
     })
+
+
+@router.post(
+    "/{run_id}/export",
+    summary="导出评估结果",
+    description="将评估运行结果导出为 CSV 或 JSON。包含每个样本的评分和汇总指标。",
+    dependencies=[Depends(require_permission("evaluation.manage"))],
+    responses={
+        200: {"description": "文件下载"},
+        404: {"description": "评估运行不存在（注意：评估结果当前为运行时内存数据）"},
+    },
+)
+async def export_evaluation(
+    run_id: str,
+    format: str = Query(default="csv", pattern="^(csv|json)$", description="导出格式"),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """
+    Export evaluation results.
+
+    NOTE: Current evaluation runner does not persist results to DB.
+    This endpoint returns a 501 placeholder until result persistence is implemented.
+    Use the /run response directly for data export until then.
+    """
+    from fastapi import HTTPException
+    raise HTTPException(
+        status_code=501,
+        detail="评估结果持久化尚未实现。请在调用 /run 时直接保存响应数据。",
+    )

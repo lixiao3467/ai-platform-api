@@ -256,7 +256,11 @@ class AppSettings(BaseSettings):
     # --- Auth ---
     jwt_secret_key: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"
-    jwt_expire_minutes: int = 1440
+    jwt_expire_minutes: int = 30          # Access token: short-lived (30 min)
+    jwt_refresh_expire_days: int = 7      # Refresh token: longer-lived (7 days)
+
+    # --- CORS ---
+    cors_allowed_origins: str = ""  # Comma-separated origins; empty = reject all in prod
 
     # --- Rate Limiting ---
     rate_limit_default: int = 1000
@@ -271,6 +275,21 @@ class AppSettings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
+
+    @computed_field
+    @property
+    def cors_origins(self) -> list[str]:
+        """Parse ``CORS_ALLOWED_ORIGINS`` env var.
+
+        Behavior:
+        - Empty / whitespace-only string → ``[]`` (reject all origins)
+        - Otherwise split on ``,`` and strip whitespace around each entry,
+          dropping empty tokens (e.g. trailing commas).
+        """
+        raw = (self.cors_allowed_origins or "").strip()
+        if not raw:
+            return []
+        return [o.strip() for o in raw.split(",") if o.strip()]
 
 
 # =============================================================================

@@ -10,13 +10,13 @@ COPY pyproject.toml .
 RUN pip install --no-cache-dir .
 
 COPY src/ src/
-COPY alembic/ alembic/
-COPY alembic.ini .
 COPY config/ config/
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
 
 ENV PYTHONPATH="/app/src"
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000
 
-CMD ["python", "-m", "uvicorn", "ai_platform.main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["./entrypoint.sh"]

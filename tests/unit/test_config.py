@@ -15,9 +15,9 @@ def test_default_settings() -> None:
     assert settings.jwt_algorithm == "HS256"
 
 
-def test_milvus_uri_computed() -> None:
-    """milvus_uri should be computed from host and port."""
-    settings = AppSettings(milvus_host="myhost", milvus_port=19530)
+def test_milvus_uri_configured_directly() -> None:
+    """milvus_uri is a plain string field that can be overridden directly."""
+    settings = AppSettings(milvus_uri="http://myhost:19530")
     assert settings.milvus_uri == "http://myhost:19530"
 
 
@@ -26,3 +26,43 @@ def test_production_detection() -> None:
     settings = AppSettings(app_env="production")
     assert settings.is_production is True
     assert settings.is_development is False
+
+
+# ---------------------------------------------------------------------------
+# CORS origin parsing (Phase 0 — Task 1)
+# ---------------------------------------------------------------------------
+
+
+def test_cors_origins_empty_returns_reject_all() -> None:
+    """An empty CORS_ALLOWED_ORIGINS value must mean 'reject all'."""
+    settings = AppSettings(cors_allowed_origins="")
+    assert settings.cors_origins == []
+
+
+def test_cors_origins_whitespace_only_returns_reject_all() -> None:
+    """Whitespace-only must be treated the same as empty."""
+    settings = AppSettings(cors_allowed_origins="   \t ")
+    assert settings.cors_origins == []
+
+
+def test_cors_origins_single_value() -> None:
+    settings = AppSettings(cors_allowed_origins="https://app.example.com")
+    assert settings.cors_origins == ["https://app.example.com"]
+
+
+def test_cors_origins_multiple_stripped() -> None:
+    """Each entry is stripped; empty tokens are dropped."""
+    settings = AppSettings(
+        cors_allowed_origins=" https://a.com , https://b.com, ,https://c.com  "
+    )
+    assert settings.cors_origins == [
+        "https://a.com",
+        "https://b.com",
+        "https://c.com",
+    ]
+
+
+def test_cors_origins_trailing_comma_ignored() -> None:
+    settings = AppSettings(cors_allowed_origins="https://a.com,")
+    assert settings.cors_origins == ["https://a.com"]
+

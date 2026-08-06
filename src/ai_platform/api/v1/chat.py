@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
+from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.chat import ChatCompletionRequest
 from ai_platform.core.model_router.litellm_client import get_llm_client
 from ai_platform.infra.database.connection import get_db
@@ -15,7 +16,7 @@ from ai_platform.services.chat_service import ChatService
 router = APIRouter()
 
 
-@router.post("/completions")
+@router.post("/completions", dependencies=[Depends(require_permission("chat.use"))])
 async def chat_completions(
     request: ChatCompletionRequest,
     ctx: RequestContext = Depends(get_request_context),

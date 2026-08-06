@@ -82,15 +82,25 @@ async def _check_redis() -> bool:
 
 
 def _check_config() -> bool:
-    """Validate critical configuration values."""
+    """Validate critical configuration values.
+
+    Raises ``RuntimeError`` in production when secrets are still using
+    insecure defaults — the process must not serve traffic with known keys.
+    """
     settings = get_settings()
     issues: list[str] = []
 
-    if not settings.app_secret_key or settings.app_secret_key.startswith("change-me"):
-        issues.append("APP_SECRET_KEY must be changed from default")
-
-    if not settings.jwt_secret_key or settings.jwt_secret_key.startswith("change-me"):
-        issues.append("JWT_SECRET_KEY must be changed from default")
+    # Production MUST NOT use default secrets
+    if settings.is_production:
+        if not settings.jwt_secret_key or settings.jwt_secret_key.startswith("change-me"):
+            raise RuntimeError("JWT_SECRET_KEY must be changed from default in production")
+        if not settings.app_secret_key or settings.app_secret_key.startswith("change-me"):
+            raise RuntimeError("APP_SECRET_KEY must be changed from default in production")
+    else:
+        if not settings.app_secret_key or settings.app_secret_key.startswith("change-me"):
+            issues.append("APP_SECRET_KEY must be changed from default")
+        if not settings.jwt_secret_key or settings.jwt_secret_key.startswith("change-me"):
+            issues.append("JWT_SECRET_KEY must be changed from default")
 
     if settings.is_production:
         if not settings.database_url or "localhost" in settings.database_url:

@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
+from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
 from ai_platform.core.agent.runtime import AgentConfig, AgentRuntime
 from ai_platform.core.agent.tools.registry import get_tool_registry
@@ -57,7 +58,7 @@ class AgentRunRequest(BaseModel):
 # =============================================================================
 
 
-@router.post("/", response_model=ApiResponse[AgentOut])
+@router.post("/", response_model=ApiResponse[AgentOut], dependencies=[Depends(require_permission("agent.write"))])
 async def create_agent(
     req: AgentCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -92,7 +93,7 @@ async def create_agent(
 # =============================================================================
 
 
-@router.get("/tools", response_model=ApiResponse[list[dict]])
+@router.get("/tools", response_model=ApiResponse[list[dict]], dependencies=[Depends(require_permission("agent.read"))])
 async def list_tools(
     ctx: RequestContext = Depends(get_request_context),
 ):
@@ -115,7 +116,7 @@ async def list_tools(
 # =============================================================================
 
 
-@router.get("/", response_model=ApiResponse[PaginatedResponse[AgentOut]])
+@router.get("/", response_model=ApiResponse[PaginatedResponse[AgentOut]], dependencies=[Depends(require_permission("agent.read"))])
 async def list_agents(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
@@ -146,7 +147,7 @@ async def list_agents(
     return ApiResponse(data=PaginatedResponse(items=items, total=total, page=page, page_size=page_size))
 
 
-@router.get("/{agent_id}", response_model=ApiResponse[AgentOut])
+@router.get("/{agent_id}", response_model=ApiResponse[AgentOut], dependencies=[Depends(require_permission("agent.read"))])
 async def get_agent(
     agent_id: uuid.UUID,
     ctx: RequestContext = Depends(get_request_context),
@@ -163,7 +164,7 @@ async def get_agent(
     ))
 
 
-@router.delete("/{agent_id}", response_model=ApiResponse)
+@router.delete("/{agent_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("agent.write"))])
 async def delete_agent(
     agent_id: uuid.UUID,
     ctx: RequestContext = Depends(get_request_context),
@@ -182,7 +183,7 @@ async def delete_agent(
 # =============================================================================
 
 
-@router.post("/{agent_id}/run")
+@router.post("/{agent_id}/run", dependencies=[Depends(require_permission("agent.execute"))])
 async def run_agent(
     agent_id: uuid.UUID,
     req: AgentRunRequest,

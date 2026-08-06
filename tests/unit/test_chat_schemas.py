@@ -121,3 +121,59 @@ def test_tool_calls_in_message() -> None:
     )
     assert len(msg.tool_calls) == 1
     assert msg.tool_calls[0].function.name == "http_request"
+
+
+# ---------------------------------------------------------------------------
+# user_id whitelist validation
+# ---------------------------------------------------------------------------
+
+
+def test_user_id_valid_characters_accepted() -> None:
+    """user_id allows alphanumeric, dash, underscore, dot."""
+    for uid in ("alice", "user-1", "user.name", "user_123", "A.B-C_1"):
+        req = ChatCompletionRequest(
+            model="gpt-4o",
+            messages=[ChatMessage(role="user", content="Hi")],
+            user_id=uid,
+        )
+        assert req.user_id == uid
+
+
+def test_user_id_none_accepted() -> None:
+    req = ChatCompletionRequest(
+        model="gpt-4o",
+        messages=[ChatMessage(role="user", content="Hi")],
+        user_id=None,
+    )
+    assert req.user_id is None
+
+
+def test_user_id_sql_injection_rejected() -> None:
+    """Blacklisted SQL injection patterns must be rejected."""
+    for uid in ("alice' OR 1=1--", "user; DROP TABLE", "admin'--", 'x" OR ""="'):
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(
+                model="gpt-4o",
+                messages=[ChatMessage(role="user", content="Hi")],
+                user_id=uid,
+            )
+
+
+def test_user_id_path_traversal_rejected() -> None:
+    for uid in ("../etc/passwd", "admin/../../root", "a\\b"):
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(
+                model="gpt-4o",
+                messages=[ChatMessage(role="user", content="Hi")],
+                user_id=uid,
+            )
+
+
+def test_user_id_space_and_special_chars_rejected() -> None:
+    for uid in ("user name", "user@name", "user!", "name=value"):
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(
+                model="gpt-4o",
+                messages=[ChatMessage(role="user", content="Hi")],
+                user_id=uid,
+            )

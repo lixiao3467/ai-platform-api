@@ -99,6 +99,9 @@ class ToolRegistry:
             headers: dict | None = None,
             body: dict | None = None,
         ) -> dict:
+            from ai_platform.core.security.ssrf import validate_url
+
+            validate_url(url)
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.request(
                     method=method.upper(),

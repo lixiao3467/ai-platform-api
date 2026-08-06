@@ -107,7 +107,7 @@ class SlidingWindowStrategy(ContextStrategy):
     Keep the most recent N messages.
 
     Simple and effective for short conversations.
-    Drops older messages entirely.
+    Drops older messages entirely. System messages are always preserved.
     """
 
     async def build_context(
@@ -119,8 +119,15 @@ class SlidingWindowStrategy(ContextStrategy):
         if len(messages) <= config.max_messages:
             return messages
 
-        # Keep the most recent messages
-        return messages[-config.max_messages:]
+        # Always preserve system messages
+        system_msgs = [m for m in messages if m.role == "system"]
+        non_system = [m for m in messages if m.role != "system"]
+
+        # Keep the most recent non-system messages
+        remaining_budget = max(0, config.max_messages - len(system_msgs))
+        recent = non_system[-remaining_budget:] if remaining_budget else []
+
+        return system_msgs + recent
 
 
 class TokenTruncateStrategy(ContextStrategy):
@@ -128,7 +135,7 @@ class TokenTruncateStrategy(ContextStrategy):
     Keep as many recent messages as fit within the token budget.
 
     More granular than sliding window — uses token count
-    instead of message count as the limit.
+    instead of message count as the limit. System messages are always preserved.
     """
 
     async def build_context(
@@ -140,18 +147,25 @@ class TokenTruncateStrategy(ContextStrategy):
         if not messages:
             return []
 
+        # Always preserve system messages (reserve their tokens first)
+        system_msgs = [m for m in messages if m.role == "system"]
+        non_system = [m for m in messages if m.role != "system"]
+
+        system_tokens = sum(TokenCounter.count_messages([m], model) for m in system_msgs)
+        remaining_budget = max(0, config.max_tokens - system_tokens)
+
         selected: list[ChatMessage] = []
         total_tokens = 0
 
         # Add messages from most recent to oldest
-        for msg in reversed(messages):
+        for msg in reversed(non_system):
             msg_tokens = TokenCounter.count_messages([msg], model)
-            if total_tokens + msg_tokens > config.max_tokens:
+            if total_tokens + msg_tokens > remaining_budget:
                 break
             selected.insert(0, msg)
             total_tokens += msg_tokens
 
-        return selected
+        return system_msgs + selected
 
 
 class SummarizeStrategy(ContextStrategy):

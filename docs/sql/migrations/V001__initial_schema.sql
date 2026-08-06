@@ -1,0 +1,382 @@
+-- =============================================================================
+-- AI Platform - Initial Schema
+-- Generated: 2026-08-05
+-- Description: Complete database schema for AI Platform
+-- =============================================================================
+
+-- Table: agents
+CREATE TABLE agents (
+	id UUID NOT NULL, 
+	app_id UUID NOT NULL, 
+	tenant_id UUID NOT NULL, 
+	name VARCHAR(128) NOT NULL, 
+	description TEXT, 
+	system_prompt TEXT, 
+	model VARCHAR(64) NOT NULL, 
+	model_config JSON NOT NULL, 
+	tools JSON NOT NULL, 
+	memory_config JSON NOT NULL, 
+	max_steps INTEGER NOT NULL, 
+	status VARCHAR(16) NOT NULL, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	updated_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(app_id) REFERENCES apps (id), 
+	FOREIGN KEY(tenant_id) REFERENCES tenants (id)
+);
+
+-- Table: api_keys
+CREATE TABLE api_keys (
+	id UUID NOT NULL, 
+	app_id UUID NOT NULL, 
+	key_prefix VARCHAR(12) NOT NULL, 
+	key_hash VARCHAR(256) NOT NULL, 
+	name VARCHAR(64), 
+	permissions JSON NOT NULL, 
+	rate_limit INTEGER NOT NULL, 
+	expires_at DATETIME, 
+	last_used_at DATETIME, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(app_id) REFERENCES apps (id)
+);
+
+-- Table: apps
+CREATE TABLE apps (
+	id UUID NOT NULL, 
+	tenant_id UUID NOT NULL, 
+	name VARCHAR(128) NOT NULL, 
+	description TEXT, 
+	app_type VARCHAR(32), 
+	config JSON NOT NULL, 
+	status VARCHAR(16) NOT NULL, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	updated_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(tenant_id) REFERENCES tenants (id)
+);
+
+-- Table: audit_logs
+CREATE TABLE audit_logs (
+	id BIGINT NOT NULL, 
+	tenant_id UUID, 
+	app_id UUID, 
+	user_id VARCHAR(128), 
+	api_key_prefix VARCHAR(12), 
+	action VARCHAR(64) NOT NULL, 
+	resource_type VARCHAR(32), 
+	resource_id VARCHAR(128), 
+	request_data JSON, 
+	response_code INTEGER, 
+	token_input INTEGER, 
+	token_output INTEGER, 
+	latency_ms INTEGER, 
+	ip_address VARCHAR(45), 
+	trace_id VARCHAR(64), 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id)
+);
+
+CREATE INDEX idx_audit_trace ON audit_logs (trace_id);
+
+CREATE INDEX idx_audit_tenant_time ON audit_logs (tenant_id, created_at);
+
+-- Table: conversations
+CREATE TABLE conversations (
+	id UUID NOT NULL, 
+	app_id UUID NOT NULL, 
+	tenant_id UUID NOT NULL, 
+	user_id VARCHAR(128), 
+	title VARCHAR(256), 
+	model VARCHAR(64), 
+	config JSON NOT NULL, 
+	message_count INTEGER NOT NULL, 
+	total_tokens BIGINT NOT NULL, 
+	status VARCHAR(16) NOT NULL, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	updated_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(app_id) REFERENCES apps (id), 
+	FOREIGN KEY(tenant_id) REFERENCES tenants (id)
+);
+
+-- Table: document_chunks
+CREATE TABLE document_chunks (
+	id UUID NOT NULL, 
+	document_id UUID NOT NULL, 
+	kb_id UUID NOT NULL, 
+	content TEXT NOT NULL, 
+	chunk_index INTEGER NOT NULL, 
+	token_count INTEGER, 
+	metadata JSON NOT NULL, 
+	vector_id VARCHAR(128), 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(document_id) REFERENCES documents (id), 
+	FOREIGN KEY(kb_id) REFERENCES knowledge_bases (id)
+);
+
+CREATE INDEX idx_chunks_document ON document_chunks (document_id);
+
+-- Table: documents
+CREATE TABLE documents (
+	id UUID NOT NULL, 
+	kb_id UUID NOT NULL, 
+	filename VARCHAR(256) NOT NULL, 
+	mime_type VARCHAR(64), 
+	file_size BIGINT, 
+	storage_path VARCHAR(512), 
+	chunk_count INTEGER NOT NULL, 
+	status VARCHAR(16) NOT NULL, 
+	error_message TEXT, 
+	metadata JSON NOT NULL, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	updated_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(kb_id) REFERENCES knowledge_bases (id)
+);
+
+CREATE INDEX idx_documents_kb ON documents (kb_id, status);
+
+-- Table: knowledge_bases
+CREATE TABLE knowledge_bases (
+	id UUID NOT NULL, 
+	app_id UUID NOT NULL, 
+	tenant_id UUID NOT NULL, 
+	name VARCHAR(128) NOT NULL, 
+	description TEXT, 
+	embedding_model VARCHAR(64) NOT NULL, 
+	chunk_config JSON NOT NULL, 
+	collection_name VARCHAR(128) NOT NULL, 
+	doc_count INTEGER NOT NULL, 
+	chunk_count INTEGER NOT NULL, 
+	status VARCHAR(16) NOT NULL, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	updated_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(app_id) REFERENCES apps (id), 
+	FOREIGN KEY(tenant_id) REFERENCES tenants (id)
+);
+
+-- Table: messages
+CREATE TABLE messages (
+	id UUID NOT NULL, 
+	conversation_id UUID NOT NULL, 
+	role VARCHAR(16) NOT NULL, 
+	content TEXT, 
+	tool_calls JSON, 
+	tool_call_id VARCHAR(64), 
+	token_count INTEGER, 
+	model VARCHAR(64), 
+	latency_ms INTEGER, 
+	metadata JSON NOT NULL, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(conversation_id) REFERENCES conversations (id)
+);
+
+CREATE INDEX idx_messages_conversation ON messages (conversation_id, created_at);
+
+-- Table: model_providers
+CREATE TABLE model_providers (
+	id UUID NOT NULL, 
+	tenant_id UUID, 
+	provider_name VARCHAR(32) NOT NULL, 
+	display_name VARCHAR(64), 
+	api_base_url VARCHAR(256), 
+	api_key_ref VARCHAR(256), 
+	models JSON NOT NULL, 
+	is_enabled BOOLEAN NOT NULL, 
+	priority INTEGER NOT NULL, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	updated_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(tenant_id) REFERENCES tenants (id)
+);
+
+-- Table: permissions
+CREATE TABLE permissions (
+	id UUID NOT NULL, 
+	resource VARCHAR(64) NOT NULL, 
+	action VARCHAR(32) NOT NULL, 
+	description VARCHAR(256), 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id)
+);
+
+-- Table: prompt_templates
+CREATE TABLE prompt_templates (
+	id UUID NOT NULL, 
+	app_id UUID, 
+	tenant_id UUID NOT NULL, 
+	name VARCHAR(128) NOT NULL, 
+	description TEXT, 
+	current_version INTEGER NOT NULL, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	updated_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(app_id) REFERENCES apps (id), 
+	FOREIGN KEY(tenant_id) REFERENCES tenants (id)
+);
+
+-- Table: prompt_versions
+CREATE TABLE prompt_versions (
+	id UUID NOT NULL, 
+	template_id UUID NOT NULL, 
+	version INTEGER NOT NULL, 
+	content TEXT NOT NULL, 
+	variables JSON NOT NULL, 
+	model_config JSON NOT NULL, 
+	change_note TEXT, 
+	created_by VARCHAR(128), 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(template_id) REFERENCES prompt_templates (id)
+);
+
+CREATE UNIQUE INDEX idx_prompt_version_unique ON prompt_versions (template_id, version);
+
+-- Table: role_permissions
+CREATE TABLE role_permissions (
+	role_id UUID NOT NULL, 
+	permission_id UUID NOT NULL, 
+	PRIMARY KEY (role_id, permission_id), 
+	FOREIGN KEY(role_id) REFERENCES roles (id), 
+	FOREIGN KEY(permission_id) REFERENCES permissions (id)
+);
+
+-- Table: roles
+CREATE TABLE roles (
+	id UUID NOT NULL, 
+	tenant_id UUID NOT NULL, 
+	name VARCHAR(64) NOT NULL, 
+	description TEXT, 
+	is_system BOOLEAN NOT NULL, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	updated_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(tenant_id) REFERENCES tenants (id)
+);
+
+CREATE INDEX idx_roles_tenant ON roles (tenant_id);
+
+-- Table: tenants
+CREATE TABLE tenants (
+	id UUID NOT NULL, 
+	name VARCHAR(128) NOT NULL, 
+	slug VARCHAR(64) NOT NULL, 
+	plan VARCHAR(32) NOT NULL, 
+	quota_config JSON NOT NULL, 
+	status VARCHAR(16) NOT NULL, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	updated_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	UNIQUE (slug)
+);
+
+-- Table: tools
+CREATE TABLE tools (
+	id UUID NOT NULL, 
+	tenant_id UUID NOT NULL, 
+	name VARCHAR(128) NOT NULL, 
+	description TEXT NOT NULL, 
+	category VARCHAR(32) NOT NULL, 
+	parameters JSON NOT NULL, 
+	handler_config JSON NOT NULL, 
+	auth_required BOOLEAN NOT NULL, 
+	timeout INTEGER NOT NULL, 
+	rate_limit INTEGER NOT NULL, 
+	status VARCHAR(16) NOT NULL, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	updated_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(tenant_id) REFERENCES tenants (id)
+);
+
+-- Table: user_roles
+CREATE TABLE user_roles (
+	user_id UUID NOT NULL, 
+	role_id UUID NOT NULL, 
+	PRIMARY KEY (user_id, role_id), 
+	FOREIGN KEY(user_id) REFERENCES users (id), 
+	FOREIGN KEY(role_id) REFERENCES roles (id)
+);
+
+-- Table: users
+CREATE TABLE users (
+	id UUID NOT NULL, 
+	tenant_id UUID NOT NULL, 
+	username VARCHAR(64) NOT NULL, 
+	email VARCHAR(128) NOT NULL, 
+	password_hash VARCHAR(256) NOT NULL, 
+	display_name VARCHAR(128), 
+	phone VARCHAR(20), 
+	avatar_url VARCHAR(512), 
+	is_active BOOLEAN NOT NULL, 
+	is_superadmin BOOLEAN NOT NULL, 
+	last_login_at DATETIME, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	updated_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(tenant_id) REFERENCES tenants (id)
+);
+
+CREATE INDEX idx_users_tenant ON users (tenant_id);
+
+CREATE UNIQUE INDEX idx_users_email ON users (email);
+
+-- Table: workflow_executions
+CREATE TABLE workflow_executions (
+	id UUID NOT NULL, 
+	workflow_id UUID NOT NULL, 
+	tenant_id UUID NOT NULL, 
+	inputs JSON NOT NULL, 
+	outputs JSON, 
+	status VARCHAR(16) NOT NULL, 
+	current_node VARCHAR(64), 
+	variables JSON NOT NULL, 
+	started_at DATETIME DEFAULT now() NOT NULL, 
+	completed_at DATETIME, 
+	error_message TEXT, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(workflow_id) REFERENCES workflows (id), 
+	FOREIGN KEY(tenant_id) REFERENCES tenants (id)
+);
+
+CREATE INDEX idx_wf_exec_status ON workflow_executions (status, started_at);
+
+-- Table: workflow_steps
+CREATE TABLE workflow_steps (
+	id UUID NOT NULL, 
+	execution_id UUID NOT NULL, 
+	node_id VARCHAR(64) NOT NULL, 
+	node_type VARCHAR(32) NOT NULL, 
+	status VARCHAR(16) NOT NULL, 
+	inputs JSON, 
+	outputs JSON, 
+	error_message TEXT, 
+	retry_count INTEGER NOT NULL, 
+	started_at DATETIME, 
+	completed_at DATETIME, 
+	duration_ms INTEGER, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(execution_id) REFERENCES workflow_executions (id)
+);
+
+-- Table: workflows
+CREATE TABLE workflows (
+	id UUID NOT NULL, 
+	app_id UUID NOT NULL, 
+	tenant_id UUID NOT NULL, 
+	name VARCHAR(128) NOT NULL, 
+	description TEXT, 
+	version INTEGER NOT NULL, 
+	definition JSON NOT NULL, 
+	variables JSON NOT NULL, 
+	status VARCHAR(16) NOT NULL, 
+	created_at DATETIME DEFAULT now() NOT NULL, 
+	updated_at DATETIME DEFAULT now() NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(app_id) REFERENCES apps (id), 
+	FOREIGN KEY(tenant_id) REFERENCES tenants (id)
+);

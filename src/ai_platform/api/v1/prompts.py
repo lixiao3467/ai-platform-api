@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
+from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
 from ai_platform.core.prompt.manager import PromptService
 from ai_platform.domain.models import PromptTemplate, PromptVersion
@@ -72,7 +73,7 @@ class PromptVersionOut(BaseModel):
 # =============================================================================
 
 
-@router.post("/", response_model=ApiResponse[PromptOut])
+@router.post("/", response_model=ApiResponse[PromptOut], dependencies=[Depends(require_permission("prompt.write"))])
 async def create_prompt(
     req: PromptCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -100,7 +101,7 @@ async def create_prompt(
     ))
 
 
-@router.get("/", response_model=ApiResponse[PaginatedResponse[PromptOut]])
+@router.get("/", response_model=ApiResponse[PaginatedResponse[PromptOut]], dependencies=[Depends(require_permission("prompt.read"))])
 async def list_prompts(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
@@ -135,7 +136,7 @@ async def list_prompts(
     return ApiResponse(data=PaginatedResponse(items=items, total=total, page=page, page_size=page_size))
 
 
-@router.post("/{prompt_id}/versions", response_model=ApiResponse[PromptVersionOut])
+@router.post("/{prompt_id}/versions", response_model=ApiResponse[PromptVersionOut], dependencies=[Depends(require_permission("prompt.write"))])
 async def create_version(
     prompt_id: uuid.UUID,
     req: PromptVersionRequest,
@@ -147,6 +148,7 @@ async def create_version(
     try:
         version = await svc.create_version(
             prompt_id, req.content,
+            tenant_id=ctx.tenant_id,
             change_note=req.change_note,
             variables=req.variables,
             model_config=req.llm_config,
@@ -163,7 +165,7 @@ async def create_version(
     ))
 
 
-@router.get("/{prompt_id}/versions", response_model=ApiResponse[list[PromptVersionOut]])
+@router.get("/{prompt_id}/versions", response_model=ApiResponse[list[PromptVersionOut]], dependencies=[Depends(require_permission("prompt.read"))])
 async def list_versions(
     prompt_id: uuid.UUID,
     ctx: RequestContext = Depends(get_request_context),
@@ -171,7 +173,7 @@ async def list_versions(
 ):
     """List all versions of a prompt template."""
     svc = PromptService(session)
-    versions = await svc.get_versions(prompt_id)
+    versions = await svc.get_versions(prompt_id, tenant_id=ctx.tenant_id)
     return ApiResponse(data=[
         PromptVersionOut(
             version=v.version, content=v.content,
@@ -183,7 +185,7 @@ async def list_versions(
     ])
 
 
-@router.post("/{prompt_id}/render", response_model=ApiResponse[dict])
+@router.post("/{prompt_id}/render", response_model=ApiResponse[dict], dependencies=[Depends(require_permission("prompt.read"))])
 async def render_prompt(
     prompt_id: uuid.UUID,
     req: PromptRenderRequest,
@@ -193,14 +195,14 @@ async def render_prompt(
     """Render a prompt template with variables."""
     svc = PromptService(session)
     try:
-        rendered = await svc.render(prompt_id, req.variables, version=req.version)
+        rendered = await svc.render(prompt_id, req.variables, tenant_id=ctx.tenant_id, version=req.version)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
     return ApiResponse(data={"rendered": rendered})
 
 
-@router.post("/{prompt_id}/ab-test", response_model=ApiResponse[dict])
+@router.post("/{prompt_id}/ab-test", response_model=ApiResponse[dict], dependencies=[Depends(require_permission("prompt.write"))])
 async def ab_test_prompt(
     prompt_id: uuid.UUID,
     req: PromptABRequest,
@@ -212,6 +214,7 @@ async def ab_test_prompt(
     try:
         results = await svc.render_ab(
             prompt_id, req.variables, req.version_a, req.version_b,
+            tenant_id=ctx.tenant_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -219,7 +222,7 @@ async def ab_test_prompt(
     return ApiResponse(data=results)
 
 
-@router.get("/{prompt_id}/diff", response_model=ApiResponse[dict])
+@router.get("/{prompt_id}/diff", response_model=ApiResponse[dict], dependencies=[Depends(require_permission("prompt.read"))])
 async def diff_versions(
     prompt_id: uuid.UUID,
     v1: int = Query(...),
@@ -230,7 +233,7 @@ async def diff_versions(
     """Compare two versions of a prompt template."""
     svc = PromptService(session)
     try:
-        diff = await svc.diff_versions(prompt_id, v1, v2)
+        diff = await svc.diff_versions(prompt_id, v1, v2, tenant_id=ctx.tenant_id)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 

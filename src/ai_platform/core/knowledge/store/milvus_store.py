@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import structlog
@@ -20,7 +21,11 @@ logger = structlog.get_logger()
 
 
 class MilvusStore:
-    """Milvus vector store for knowledge base embeddings."""
+    """Milvus vector store for knowledge base embeddings.
+
+    The ``pymilvus`` client is blocking; every sync call is dispatched to a
+    worker thread via ``asyncio.to_thread`` so the event loop is never blocked.
+    """
 
     def __init__(self, collection_name: str, embedding_model: str) -> None:
         settings = get_settings()
@@ -32,19 +37,21 @@ class MilvusStore:
     async def _get_client(self) -> MilvusClient:
         """Get or create Milvus client."""
         if self._client is None:
-            # Zilliz Cloud uses uri + token authentication
-            if self._token:
-                self._client = MilvusClient(uri=self._uri, token=self._token)
-            else:
-                # Local Milvus without authentication
-                self._client = MilvusClient(uri=self._uri)
+            def _connect() -> MilvusClient:
+                # Zilliz Cloud uses uri + token authentication
+                if self._token:
+                    return MilvusClient(uri=self._uri, token=self._token)
+                return MilvusClient(uri=self._uri)
+
+            self._client = await asyncio.to_thread(_connect)
             # Ensure collection exists
-            if not self._client.has_collection(self._collection_name):
-                self._create_collection()
+            has = await asyncio.to_thread(self._client.has_collection, self._collection_name)
+            if not has:
+                await self._create_collection_async()
         return self._client
 
     def _create_collection(self) -> None:
-        """Create a Milvus collection with standard schema."""
+        """Create a Milvus collection with standard schema (synchronous)."""
         if self._client is None:
             return
 
@@ -74,6 +81,10 @@ class MilvusStore:
         )
         logger.info("Created Milvus collection", name=self._collection_name)
 
+    async def _create_collection_async(self) -> None:
+        """Async wrapper for _create_collection — runs in a worker thread."""
+        await asyncio.to_thread(self._create_collection)
+
     async def insert(
         self,
         collection_name: str,
@@ -93,7 +104,7 @@ class MilvusStore:
             "chunk_index": metadata.get("chunk_index", 0),
         }
 
-        client.insert(collection_name=collection_name, data=[data])
+        await asyncio.to_thread(client.insert, collection_name=collection_name, data=[data])
 
     async def search(
         self,
@@ -104,13 +115,16 @@ class MilvusStore:
         """Search for similar vectors."""
         client = await self._get_client()
 
-        results = client.search(
-            collection_name=collection_name,
-            data=[query_embedding],
-            limit=top_k,
-            output_fields=["content", "document_id", "kb_id", "chunk_index"],
-            search_params={"metric_type": "COSINE", "params": {"nprobe": 16}},
-        )
+        def _search():
+            return client.search(
+                collection_name=collection_name,
+                data=[query_embedding],
+                limit=top_k,
+                output_fields=["content", "document_id", "kb_id", "chunk_index"],
+                search_params={"metric_type": "COSINE", "params": {"nprobe": 16}},
+            )
+
+        results = await asyncio.to_thread(_search)
 
         hits = []
         if results and results[0]:
@@ -131,8 +145,9 @@ class MilvusStore:
     async def delete_collection(self, collection_name: str) -> None:
         """Drop a collection."""
         client = await self._get_client()
-        if client.has_collection(collection_name):
-            client.drop_collection(collection_name)
+        has = await asyncio.to_thread(client.has_collection, collection_name)
+        if has:
+            await asyncio.to_thread(client.drop_collection, collection_name)
             logger.info("Dropped Milvus collection", name=collection_name)
 
 

@@ -291,8 +291,10 @@ class HTTPRequestNode(BaseNode):
 
     async def execute(self, context: ExecutionContext) -> Any:
         import httpx
+        from ai_platform.core.security.ssrf import validate_url
 
         url = context.resolve_expression(self.config.get("url", ""))
+        validate_url(url)
         method = self.config.get("method", "GET").upper()
         headers = self.config.get("headers", {})
         body = self.config.get("body")
@@ -355,11 +357,18 @@ class MergeNode(BaseNode):
         return {"type": "merge_gate"}
 
 
+MAX_DELAY_SECONDS = 3600  # 1 hour — absolute ceiling for DelayNode
+
+
 class DelayNode(BaseNode):
     node_type = NodeType.DELAY
 
     async def execute(self, context: ExecutionContext) -> Any:
         seconds = self.config.get("seconds", 1)
+        if not isinstance(seconds, (int, float)) or seconds < 0:
+            raise ValueError(f"Delay seconds must be a non-negative number, got {seconds!r}")
+        if seconds > MAX_DELAY_SECONDS:
+            raise ValueError(f"Delay exceeds maximum of {MAX_DELAY_SECONDS}s")
         await asyncio.sleep(seconds)
         return {"delayed": seconds}
 

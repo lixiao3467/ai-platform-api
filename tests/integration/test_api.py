@@ -33,9 +33,10 @@ class TestHealth:
         resp = await client.get("/health")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["service"] == "ai-platform"
-        assert data["version"] == "0.1.0"
-        assert "dependencies" in data
+        assert data["code"] == 0
+        assert data["data"]["service"] == "ai-platform"
+        assert data["data"]["version"] == "0.1.0"
+        assert "dependencies" in data["data"]
 
     @pytest.mark.asyncio
     async def test_metrics_endpoint(self, client: AsyncClient) -> None:

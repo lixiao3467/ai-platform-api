@@ -130,13 +130,19 @@ class PromptService:
         template_id: uuid.UUID,
         content: str,
         *,
+        tenant_id: uuid.UUID,
         change_note: str | None = None,
         variables: list[dict] | None = None,
         model_config: dict | None = None,
         created_by: str | None = None,
     ) -> PromptVersion:
         """Create a new version of an existing template."""
-        template = await self._db.get(PromptTemplate, template_id)
+        stmt = select(PromptTemplate).where(
+            PromptTemplate.id == template_id,
+            PromptTemplate.tenant_id == tenant_id,
+        )
+        result = await self._db.execute(stmt)
+        template = result.scalars().first()
         if not template:
             raise ValueError(f"Template {template_id} not found")
 
@@ -175,16 +181,23 @@ class PromptService:
         template_id: uuid.UUID,
         variables: dict[str, Any],
         *,
+        tenant_id: uuid.UUID,
         version: int | None = None,
     ) -> str:
         """Render a template with variables. Uses latest version if not specified."""
         if version:
-            stmt = select(PromptVersion).where(
+            stmt = select(PromptVersion).join(PromptTemplate).where(
                 PromptVersion.template_id == template_id,
                 PromptVersion.version == version,
+                PromptTemplate.tenant_id == tenant_id,
             )
         else:
-            template = await self._db.get(PromptTemplate, template_id)
+            stmt = select(PromptTemplate).where(
+                PromptTemplate.id == template_id,
+                PromptTemplate.tenant_id == tenant_id,
+            )
+            result = await self._db.execute(stmt)
+            template = result.scalars().first()
             if not template:
                 raise ValueError(f"Template {template_id} not found")
             stmt = select(PromptVersion).where(
@@ -205,27 +218,35 @@ class PromptService:
         variables: dict[str, Any],
         version_a: int,
         version_b: int,
+        *,
+        tenant_id: uuid.UUID,
     ) -> dict[str, str]:
         """Render two versions simultaneously for A/B testing."""
-        content_a = await self.render(template_id, variables, version=version_a)
-        content_b = await self.render(template_id, variables, version=version_b)
+        content_a = await self.render(template_id, variables, tenant_id=tenant_id, version=version_a)
+        content_b = await self.render(template_id, variables, tenant_id=tenant_id, version=version_b)
         return {"version_a": content_a, "version_b": content_b}
 
-    async def get_versions(self, template_id: uuid.UUID) -> list[PromptVersion]:
+    async def get_versions(
+        self, template_id: uuid.UUID, *, tenant_id: uuid.UUID,
+    ) -> list[PromptVersion]:
         """Get all versions of a template."""
         stmt = (
             select(PromptVersion)
-            .where(PromptVersion.template_id == template_id)
+            .join(PromptTemplate)
+            .where(
+                PromptVersion.template_id == template_id,
+                PromptTemplate.tenant_id == tenant_id,
+            )
             .order_by(PromptVersion.version.desc())
         )
         result = await self._db.execute(stmt)
         return list(result.scalars().all())
 
     async def diff_versions(
-        self, template_id: uuid.UUID, v1: int, v2: int
+        self, template_id: uuid.UUID, v1: int, v2: int, *, tenant_id: uuid.UUID,
     ) -> dict[str, Any]:
         """Compare two versions of a template."""
-        versions = await self.get_versions(template_id)
+        versions = await self.get_versions(template_id, tenant_id=tenant_id)
         ver1 = next((v for v in versions if v.version == v1), None)
         ver2 = next((v for v in versions if v.version == v2), None)
 

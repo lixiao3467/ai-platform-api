@@ -12,7 +12,16 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from ai_platform.api.middleware.auth import RequestContext, get_request_context, create_jwt_token
+from ai_platform.api.middleware.auth import (
+    RequestContext,
+    get_request_context,
+    create_jwt_token,
+    create_refresh_token,
+    decode_jwt_token,
+    revoke_refresh_token,
+    is_refresh_token_revoked,
+)
+from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
 from ai_platform.domain.models import Permission, Role, User, role_permissions, user_roles
 from ai_platform.infra.database.connection import get_db
@@ -45,7 +54,19 @@ class LoginRequest(BaseModel):
 
 class LoginResponse(BaseModel):
     token: str
+    refresh_token: str
+    expires_in: int = 0  # seconds until access token expires
     user: dict
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class RefreshResponse(BaseModel):
+    token: str
+    refresh_token: str
+    expires_in: int = 0
 
 
 class UserCreateRequest(BaseModel):
@@ -116,12 +137,22 @@ class PermissionOut(BaseModel):
 # =============================================================================
 
 
-@auth_router.post("/login", response_model=ApiResponse[LoginResponse])
+@auth_router.post(
+    "/login",
+    response_model=ApiResponse[LoginResponse],
+    summary="用户登录",
+    description="使用用户名和密码登录，返回 access token 和 refresh token。access token 有效期较短（默认30分钟），refresh token 有效期较长（默认7天）。",
+    responses={
+        200: {"description": "登录成功"},
+        401: {"description": "用户名或密码错误"},
+        403: {"description": "账号已被禁用"},
+    },
+)
 async def login(
     req: LoginRequest,
     session: AsyncSession = Depends(get_db),
 ):
-    """用户登录 — 返回 JWT Token。"""
+    """用户登录 — 返回 access token + refresh token。"""
     stmt = select(User).where(User.username == req.username).options(selectinload(User.roles))
     result = await session.execute(stmt)
     user = result.scalars().first()
@@ -136,10 +167,16 @@ async def login(
     user.last_login_at = datetime.now(tz=timezone.utc)
     await session.flush()
 
-    token = create_jwt_token(str(user.tenant_id), str(user.id))
+    from ai_platform.config import get_settings
+    settings = get_settings()
+
+    access_token = create_jwt_token(str(user.tenant_id), str(user.id))
+    refresh_token = create_refresh_token(str(user.tenant_id), str(user.id))
 
     return ApiResponse(data=LoginResponse(
-        token=token,
+        token=access_token,
+        refresh_token=refresh_token,
+        expires_in=settings.jwt_expire_minutes * 60,
         user={
             "id": str(user.id),
             "username": user.username,
@@ -152,12 +189,108 @@ async def login(
     ))
 
 
+@auth_router.post(
+    "/refresh",
+    response_model=ApiResponse[RefreshResponse],
+    summary="刷新访问令牌",
+    description="使用 refresh token 获取新的 access token 和 refresh token（rotation）。旧的 refresh token 立即失效。",
+    responses={
+        200: {"description": "刷新成功，返回新 token 对"},
+        401: {"description": "refresh token 无效、已过期或已被撤销"},
+    },
+)
+async def refresh_token(
+    req: RefreshRequest,
+    session: AsyncSession = Depends(get_db),
+):
+    """刷新令牌 — 用 refresh token 换取新的 access + refresh token pair (rotation)。"""
+    from ai_platform.config import get_settings
+    settings = get_settings()
+
+    # 1. Decode and validate the refresh token
+    try:
+        from jose import jwt, JWTError
+        payload = jwt.decode(
+            req.refresh_token,
+            settings.jwt_secret_key,
+            algorithms=[settings.jwt_algorithm],
+            options={"verify_exp": True, "verify_aud": False},
+        )
+    except JWTError:
+        raise HTTPException(status_code=401, detail="refresh token 无效或已过期")
+
+    # 2. Must be a refresh-type token
+    if payload.get("type") != "refresh":
+        raise HTTPException(status_code=401, detail="token 类型错误")
+
+    # 3. Check revocation list
+    jti = payload.get("jti", "")
+    if await is_refresh_token_revoked(jti):
+        raise HTTPException(status_code=401, detail="refresh token 已被撤销")
+
+    # 4. Verify user still exists and is active
+    user_id = payload.get("sub")
+    tenant_id = payload.get("tenant_id")
+    if not user_id or not tenant_id:
+        raise HTTPException(status_code=401, detail="token 数据不完整")
+
+    stmt = select(User).where(User.id == user_id, User.tenant_id == tenant_id)
+    result = await session.execute(stmt)
+    user = result.scalars().first()
+
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="用户不存在或已被禁用")
+
+    # 5. Revoke old refresh token (rotation)
+    await revoke_refresh_token(jti)
+
+    # 6. Issue new token pair
+    new_access = create_jwt_token(str(user.tenant_id), str(user.id))
+    new_refresh = create_refresh_token(str(user.tenant_id), str(user.id))
+
+    return ApiResponse(data=RefreshResponse(
+        token=new_access,
+        refresh_token=new_refresh,
+        expires_in=settings.jwt_expire_minutes * 60,
+    ))
+
+
+@auth_router.post(
+    "/logout",
+    response_model=ApiResponse,
+    summary="登出",
+    description="撤销当前 refresh token，使其无法再用于刷新。",
+)
+async def logout(
+    req: RefreshRequest,
+):
+    """登出 — 撤销 refresh token。"""
+    try:
+        from jose import jwt, JWTError
+        from ai_platform.config import get_settings
+        settings = get_settings()
+
+        payload = jwt.decode(
+            req.refresh_token,
+            settings.jwt_secret_key,
+            algorithms=[settings.jwt_algorithm],
+            options={"verify_exp": False, "verify_aud": False},
+        )
+        jti = payload.get("jti", "")
+        if jti:
+            await revoke_refresh_token(jti)
+    except Exception:
+        pass  # Best effort — even if token is invalid, we return success
+
+    return ApiResponse(message="已登出")
+
+
 # =============================================================================
 # Users CRUD
 # =============================================================================
 
 
-@users_router.get("/", response_model=ApiResponse[PaginatedResponse[UserOut]])
+@users_router.get("/", response_model=ApiResponse[PaginatedResponse[UserOut]], dependencies=[Depends(require_permission("user.manage"))])
 async def list_users(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
@@ -187,7 +320,7 @@ async def list_users(
     ))
 
 
-@users_router.post("/", response_model=ApiResponse[UserOut])
+@users_router.post("/", response_model=ApiResponse[UserOut], dependencies=[Depends(require_permission("user.manage"))])
 async def create_user(
     req: UserCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -232,7 +365,7 @@ async def create_user(
     return ApiResponse(data=_user_to_out(user))
 
 
-@users_router.put("/{user_id}", response_model=ApiResponse[UserOut])
+@users_router.put("/{user_id}", response_model=ApiResponse[UserOut], dependencies=[Depends(require_permission("user.update"))])
 async def update_user(
     user_id: uuid.UUID,
     req: UserUpdateRequest,
@@ -267,7 +400,7 @@ async def update_user(
     return ApiResponse(data=_user_to_out(user))
 
 
-@users_router.delete("/{user_id}", response_model=ApiResponse)
+@users_router.delete("/{user_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("user.delete"))])
 async def delete_user(
     user_id: uuid.UUID,
     ctx: RequestContext = Depends(get_request_context),
@@ -285,7 +418,7 @@ async def delete_user(
     return ApiResponse(message="用户已删除")
 
 
-@users_router.post("/{user_id}/reset-password", response_model=ApiResponse)
+@users_router.post("/{user_id}/reset-password", response_model=ApiResponse, dependencies=[Depends(require_permission("user.update"))])
 async def reset_password(
     user_id: uuid.UUID,
     req: ResetPasswordRequest,
@@ -308,7 +441,7 @@ async def reset_password(
 # =============================================================================
 
 
-@roles_router.get("/", response_model=ApiResponse[list[RoleOut]])
+@roles_router.get("/", response_model=ApiResponse[list[RoleOut]], dependencies=[Depends(require_permission("user.manage"))])
 async def list_roles(
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
@@ -341,7 +474,7 @@ async def list_roles(
     return ApiResponse(data=items)
 
 
-@roles_router.post("/", response_model=ApiResponse[RoleOut])
+@roles_router.post("/", response_model=ApiResponse[RoleOut], dependencies=[Depends(require_permission("user.manage"))])
 async def create_role(
     req: RoleCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -374,7 +507,7 @@ async def create_role(
     ))
 
 
-@roles_router.put("/{role_id}", response_model=ApiResponse[RoleOut])
+@roles_router.put("/{role_id}", response_model=ApiResponse[RoleOut], dependencies=[Depends(require_permission("user.manage"))])
 async def update_role(
     role_id: uuid.UUID,
     req: RoleUpdateRequest,
@@ -401,7 +534,7 @@ async def update_role(
     return ApiResponse(message="角色已更新")
 
 
-@roles_router.delete("/{role_id}", response_model=ApiResponse)
+@roles_router.delete("/{role_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("user.manage"))])
 async def delete_role(
     role_id: uuid.UUID,
     ctx: RequestContext = Depends(get_request_context),
@@ -424,7 +557,7 @@ async def delete_role(
 # =============================================================================
 
 
-@roles_router.get("/permissions", response_model=ApiResponse[list[PermissionOut]])
+@roles_router.get("/permissions", response_model=ApiResponse[list[PermissionOut]], dependencies=[Depends(require_permission("user.manage"))])
 async def list_permissions(
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),

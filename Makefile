@@ -56,23 +56,70 @@ typecheck: ## Run type checking only
 	mypy src/ai_platform/
 
 # =============================================================================
-# Database
+# Database Schema Management
 # =============================================================================
 
-migrate-init: ## Initialize Alembic
-	alembic init alembic
+schema-export: ## Export current ORM schema to SQL
+	PYTHONPATH=src python scripts/export_schema.py
 
-migrate-create: ## Create new migration (usage: make migrate-create msg="add_users_table")
-	alembic revision --autogenerate -m "$(msg)"
+schema-status: ## Show schema version (checks schema_versions table)
+	@echo "Environment: $${APP_ENV:-development}"
+	@echo "Database: $${DATABASE_URL%%@*}***"
+	@psql "$$DATABASE_URL" -c "SELECT version, applied_at, description FROM schema_versions ORDER BY applied_at DESC LIMIT 5;" 2>/dev/null || echo "No schema_versions table found"
 
-migrate-up: ## Apply all pending migrations
-	alembic upgrade head
+# =============================================================================
+# SQL Migration Scripts
+# =============================================================================
 
-migrate-down: ## Revert last migration
-	alembic downgrade -1
+migrate-list: ## List all SQL migration scripts
+	@echo "Available migrations in docs/sql/migrations/:"
+	@ls -1 docs/sql/migrations/*.sql 2>/dev/null | sed 's/.*\///' || echo "No migrations found"
 
-migrate-history: ## Show migration history
-	alembic history --verbose
+migrate-apply: ## Apply SQL migration manually (usage: make migrate-apply file=V002__xxx.sql)
+	@if [ -z "$(file)" ]; then \
+		echo "Usage: make migrate-apply file=V002__description.sql"; \
+		exit 1; \
+	fi
+	@echo "Applying migration: $(file)"
+	@psql "$$DATABASE_URL" -f docs/sql/migrations/$(file)
+	@echo "Migration applied successfully"
+
+migrate-apply-prod: ## Apply SQL migration to production (requires confirmation)
+	@if [ -z "$(file)" ]; then \
+		echo "Usage: make migrate-apply-prod file=V002__description.sql"; \
+		exit 1; \
+	fi
+	@echo "=========================================="
+	@echo "PRODUCTION MIGRATION"
+	@echo "=========================================="
+	@echo "File: $(file)"
+	@echo "Database: $${DATABASE_URL%%@*}***"
+	@echo ""
+	@echo "WARNING: This will modify the production database!"
+	@echo "Ensure you have a backup before proceeding."
+	@read -p "Press Enter to continue or Ctrl+C to abort..."
+	psql "$$DATABASE_URL" -f docs/sql/migrations/$(file)
+
+# =============================================================================
+# Environment-Specific Deployment
+# =============================================================================
+
+deploy-dev: ## Deploy to development (auto-migrate)
+	@echo "🔧 Deploying to DEVELOPMENT..."
+	APP_ENV=development ALLOW_PROD_MIGRATION=false ./entrypoint.sh
+
+deploy-staging: ## Deploy to staging (auto-migrate with warning)
+	@echo "🚀 Deploying to STAGING..."
+	APP_ENV=staging ALLOW_PROD_MIGRATION=false ./entrypoint.sh
+
+deploy-prod: ## Deploy to production (requires ALLOW_PROD_MIGRATION=true)
+	@echo "⚠️  Deploying to PRODUCTION..."
+	@if [ "$${ALLOW_PROD_MIGRATION}" != "true" ]; then \
+		echo "❌ Production deployment blocked."; \
+		echo "   Run: ALLOW_PROD_MIGRATION=true make deploy-prod"; \
+		exit 1; \
+	fi
+	APP_ENV=production ALLOW_PROD_MIGRATION=true ./entrypoint.sh
 
 # =============================================================================
 # Docker

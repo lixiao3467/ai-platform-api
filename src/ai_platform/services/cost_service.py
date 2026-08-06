@@ -117,12 +117,20 @@ class CostService:
         total_output = row.total_output or 0
         total_requests = row.total_requests or 0
 
-        # Per-model breakdown — extract model from action or request_data
-        model_stmt = select(
-            AuditLog.request_data,
-            AuditLog.token_input,
-            AuditLog.token_output,
-        ).where(and_(*conditions))
+        # Per-model breakdown — server-side GROUP BY using JSON path extraction.
+        # request_data is a JSON column; PostgreSQL json_extract_path_text
+        # lets us aggregate per model without loading every row into memory.
+        model_expr = AuditLog.request_data["model"].as_string()
+        model_stmt = (
+            select(
+                model_expr.label("model_name"),
+                func.coalesce(func.sum(AuditLog.token_input), 0).label("total_input"),
+                func.coalesce(func.sum(AuditLog.token_output), 0).label("total_output"),
+                func.count().label("call_count"),
+            )
+            .where(and_(*conditions))
+            .group_by(model_expr)
+        )
         model_result = await self._db.execute(model_stmt)
         model_rows = model_result.all()
 
@@ -130,24 +138,17 @@ class CostService:
         total_cost = 0.0
 
         for row in model_rows:
-            req_data = row.request_data or {}
-            model = req_data.get("model", "unknown")
-            inp = row.token_input or 0
-            out = row.token_output or 0
-
-            if model not in by_model:
-                by_model[model] = {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "requests": 0,
-                    "cost_usd": 0.0,
-                }
+            model = row.model_name or "unknown"
+            inp = int(row.total_input or 0)
+            out = int(row.total_output or 0)
 
             cost = calculate_cost(model, inp, out)
-            by_model[model]["input_tokens"] += inp
-            by_model[model]["output_tokens"] += out
-            by_model[model]["requests"] += 1
-            by_model[model]["cost_usd"] = round(by_model[model]["cost_usd"] + cost, 6)
+            by_model[model] = {
+                "input_tokens": inp,
+                "output_tokens": out,
+                "requests": int(row.call_count or 0),
+                "cost_usd": round(cost, 6),
+            }
             total_cost += cost
 
         return CostSummary(

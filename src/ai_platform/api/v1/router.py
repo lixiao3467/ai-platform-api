@@ -51,9 +51,34 @@ from ai_platform.api.v1 import evaluations  # noqa: E402
 
 api_router.include_router(evaluations.router, prefix="/evaluations", tags=["evaluations"])
 
+# --- Audit Logs ---
+from ai_platform.api.v1 import audit_logs  # noqa: E402
+
+api_router.include_router(audit_logs.router, prefix="/audit-logs", tags=["audit-logs"])
+
+# --- SSO Providers ---
+from ai_platform.api.v1 import sso  # noqa: E402
+
+api_router.include_router(sso.router, prefix="/sso", tags=["sso"])
+
+# --- API Key Management ---
+from ai_platform.api.v1 import api_keys  # noqa: E402
+
+api_router.include_router(api_keys.router, prefix="/api-keys", tags=["api-keys"])
+
+# --- Metrics ---
+from ai_platform.api.v1 import metrics_api  # noqa: E402
+
+api_router.include_router(metrics_api.router, prefix="/metrics", tags=["metrics"])
+
 # --- Users & Roles (RBAC) ---
 from ai_platform.api.v1 import users as users_module  # noqa: E402
 
 api_router.include_router(users_module.users_router, prefix="/users", tags=["users"])
 api_router.include_router(users_module.roles_router, prefix="/roles", tags=["roles"])
 api_router.include_router(users_module.auth_router, prefix="/auth", tags=["auth"])
+
+# --- Tenant Self-Service ---
+from ai_platform.api.v1 import tenant_self  # noqa: E402
+
+api_router.include_router(tenant_self.router, prefix="/tenant", tags=["tenant"])

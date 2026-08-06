@@ -6,10 +6,12 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
+from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse
 from ai_platform.infra.database.connection import get_db
 from ai_platform.services.cost_service import CostService
@@ -21,7 +23,7 @@ class BudgetCheckRequest(BaseModel):
     monthly_budget_usd: float = Field(gt=0, description="Monthly budget in USD")
 
 
-@router.get("/summary", response_model=ApiResponse)
+@router.get("/summary", response_model=ApiResponse, dependencies=[Depends(require_permission("cost.read"))])
 async def get_cost_summary(
     start_date: datetime | None = Query(default=None),
     end_date: datetime | None = Query(default=None),
@@ -40,7 +42,7 @@ async def get_cost_summary(
     return ApiResponse(data=summary.__dict__)
 
 
-@router.get("/daily", response_model=ApiResponse)
+@router.get("/daily", response_model=ApiResponse, dependencies=[Depends(require_permission("cost.read"))])
 async def get_daily_costs(
     days: int = Query(default=30, ge=1, le=365),
     ctx: RequestContext = Depends(get_request_context),
@@ -52,7 +54,7 @@ async def get_daily_costs(
     return ApiResponse(data=daily)
 
 
-@router.post("/budget-check", response_model=ApiResponse)
+@router.post("/budget-check", response_model=ApiResponse, dependencies=[Depends(require_permission("cost.read"))])
 async def check_budget(
     req: BudgetCheckRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -62,3 +64,62 @@ async def check_budget(
     svc = CostService(session)
     result = await svc.check_budget(ctx.tenant_id, req.monthly_budget_usd)
     return ApiResponse(data=result)
+
+
+@router.get(
+    "/export",
+    summary="导出成本数据",
+    description="将每日成本明细导出为 CSV 或 JSON。支持大数据量流式下载。",
+    dependencies=[Depends(require_permission("cost.read"))],
+    responses={
+        200: {"description": "文件下载", "content": {"text/csv": {}, "application/json": {}}},
+    },
+)
+async def export_costs(
+    days: int = Query(default=30, ge=1, le=365, description="导出最近 N 天的数据"),
+    format: str = Query(default="csv", pattern="^(csv|json)$", description="导出格式"),
+    app_id: uuid.UUID | None = Query(default=None, description="按应用过滤"),
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """Export daily cost data as CSV or JSON (streaming)."""
+    svc = CostService(session)
+    daily_data = await svc.get_daily_costs(ctx.tenant_id, days=days)
+
+    if format == "json":
+        import json
+        import io
+
+        content = json.dumps(daily_data, ensure_ascii=False, indent=2)
+        return StreamingResponse(
+            io.StringIO(content),
+            media_type="application/json; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="costs-{days}days.json"'},
+        )
+
+    # CSV
+    import csv
+    import io
+
+    output = io.StringIO()
+    output.write("﻿")  # BOM for Excel
+    writer = csv.writer(output, lineterminator="\r\n")
+    writer.writerow(["日期", "输入 Tokens", "输出 Tokens", "请求数", "预估费用 (USD)"])
+    for row in daily_data:
+        writer.writerow([
+            row.get("date", ""),
+            row.get("input_tokens", 0),
+            row.get("output_tokens", 0),
+            row.get("requests", 0),
+            f"{row.get('estimated_cost_usd', 0):.4f}",
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        io.StringIO(output.getvalue()),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="costs-{days}days.csv"',
+            "X-Accel-Buffering": "no",
+        },
+    )

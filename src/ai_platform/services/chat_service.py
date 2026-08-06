@@ -82,8 +82,8 @@ class ChatService:
             )
 
         # 7. Update conversation stats
-        conversation.message_count += 2  # user + assistant
-        conversation.total_tokens += response.usage.total_tokens
+        conversation.message_count = (conversation.message_count or 0) + 2  # user + assistant
+        conversation.total_tokens = (conversation.total_tokens or 0) + (response.usage.total_tokens or 0)
         await self._db.flush()
 
         return response
@@ -170,7 +170,8 @@ class ChatService:
                     ChatMessage(role="assistant", content=full_content),
                     model=model,
                 )
-                conversation.message_count += 2
+                conversation.message_count = (conversation.message_count or 0) + 2
+                conversation.total_tokens = conversation.total_tokens or 0
                 await self._db.flush()
             except Exception as e:
                 # Stream persistence failure shouldn't crash the stream
@@ -188,7 +189,13 @@ class ChatService:
     ) -> Conversation:
         """Load existing conversation or create a new one."""
         if request.conversation_id:
-            conv = await self._db.get(Conversation, request.conversation_id)
+            # Tenant isolation: must filter by tenant_id to prevent cross-tenant access
+            stmt = select(Conversation).where(
+                Conversation.id == request.conversation_id,
+                Conversation.tenant_id == tenant_id,
+            )
+            result = await self._db.execute(stmt)
+            conv = result.scalars().first()
             if conv:
                 return conv
 

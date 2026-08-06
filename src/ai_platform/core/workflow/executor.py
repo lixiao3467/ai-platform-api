@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 import structlog
@@ -108,9 +109,7 @@ class WorkflowExecutor:
             execution.status = ExecutionStatus.FAILED
             execution.error_message = str(e)[:1000]
 
-        execution.completed_at = __import__("datetime").datetime.now(
-            tz=__import__("datetime").timezone.utc
-        )
+        execution.completed_at = datetime.now(tz=timezone.utc)
         await self._db.flush()
         return execution
 
@@ -211,8 +210,6 @@ class WorkflowExecutor:
         error: str | None = None,
     ) -> None:
         """Persist a workflow step to the database."""
-        import datetime
-
         step = WorkflowStep(
             id=uuid.uuid4(),
             execution_id=execution_id,
@@ -221,8 +218,8 @@ class WorkflowExecutor:
             status=status,
             outputs=_safe_serialize(output),
             error_message=error,
-            started_at=datetime.datetime.fromtimestamp(start_time, tz=datetime.timezone.utc),
-            completed_at=datetime.datetime.now(tz=datetime.timezone.utc),
+            started_at=datetime.fromtimestamp(start_time, tz=timezone.utc),
+            completed_at=datetime.now(tz=timezone.utc),
             duration_ms=int((time.time() - start_time) * 1000),
         )
         self._db.add(step)

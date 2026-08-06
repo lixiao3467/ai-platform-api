@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncGenerator
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -47,12 +48,15 @@ def _normalize_database_url(url: str) -> tuple[str, dict]:
 
 
 async def init_db() -> None:
-    """Initialize DB engine and auto-create tables if they don't exist."""
-    engine = get_engine()
-    from ai_platform.domain.models import Base
+    """Initialize DB engine and verify connectivity.
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    Schema is managed exclusively by Alembic migrations (alembic upgrade head).
+    No create_all here — code must never mutate production schema.
+    """
+    engine = get_engine()
+    # Verify the connection is alive; fail fast if DB is unreachable.
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
 
 
 def get_engine() -> AsyncEngine:
@@ -103,12 +107,6 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         except Exception:
             await session.rollback()
             raise
-
-
-async def init_db() -> None:
-    """Initialize database engine (called on app startup)."""
-    get_engine()
-    get_session_factory()
 
 
 async def close_db() -> None:

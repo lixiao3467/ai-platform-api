@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
+from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
 from ai_platform.core.workflow.engine import (
     EdgeDefinition,
@@ -98,7 +99,7 @@ class StepOut(BaseModel):
 # =============================================================================
 
 
-@router.post("/", response_model=ApiResponse[WorkflowOut])
+@router.post("/", response_model=ApiResponse[WorkflowOut], dependencies=[Depends(require_permission("workflow.write"))])
 async def create_workflow(
     req: WorkflowCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -137,7 +138,7 @@ async def create_workflow(
     ))
 
 
-@router.get("/", response_model=ApiResponse[PaginatedResponse[WorkflowOut]])
+@router.get("/", response_model=ApiResponse[PaginatedResponse[WorkflowOut]], dependencies=[Depends(require_permission("workflow.read"))])
 async def list_workflows(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
@@ -171,7 +172,7 @@ async def list_workflows(
     return ApiResponse(data=PaginatedResponse(items=items, total=total, page=page, page_size=page_size))
 
 
-@router.get("/{workflow_id}", response_model=ApiResponse[WorkflowDetailOut])
+@router.get("/{workflow_id}", response_model=ApiResponse[WorkflowDetailOut], dependencies=[Depends(require_permission("workflow.read"))])
 async def get_workflow(
     workflow_id: uuid.UUID,
     ctx: RequestContext = Depends(get_request_context),
@@ -192,7 +193,7 @@ async def get_workflow(
     ))
 
 
-@router.post("/{workflow_id}/publish", response_model=ApiResponse)
+@router.post("/{workflow_id}/publish", response_model=ApiResponse, dependencies=[Depends(require_permission("workflow.write"))])
 async def publish_workflow(
     workflow_id: uuid.UUID,
     ctx: RequestContext = Depends(get_request_context),
@@ -212,7 +213,7 @@ async def publish_workflow(
 # =============================================================================
 
 
-@router.post("/{workflow_id}/execute", response_model=ApiResponse[ExecutionOut])
+@router.post("/{workflow_id}/execute", response_model=ApiResponse[ExecutionOut], dependencies=[Depends(require_permission("workflow.write"))])
 async def execute_workflow(
     workflow_id: uuid.UUID,
     req: WorkflowExecuteRequest,
@@ -246,7 +247,7 @@ async def execute_workflow(
     ))
 
 
-@router.get("/executions/{exec_id}", response_model=ApiResponse[ExecutionOut])
+@router.get("/executions/{exec_id}", response_model=ApiResponse[ExecutionOut], dependencies=[Depends(require_permission("workflow.read"))])
 async def get_execution(
     exec_id: uuid.UUID,
     ctx: RequestContext = Depends(get_request_context),
@@ -265,7 +266,7 @@ async def get_execution(
     ))
 
 
-@router.get("/executions/{exec_id}/steps", response_model=ApiResponse[list[StepOut]])
+@router.get("/executions/{exec_id}/steps", response_model=ApiResponse[list[StepOut]], dependencies=[Depends(require_permission("workflow.read"))])
 async def get_execution_steps(
     exec_id: uuid.UUID,
     ctx: RequestContext = Depends(get_request_context),

@@ -94,6 +94,7 @@ class ApiKey(Base):
     rate_limit: Mapped[int] = mapped_column(Integer, default=1000)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     app: Mapped[App] = relationship(back_populates="api_keys")
@@ -539,3 +540,34 @@ class Permission(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     roles: Mapped[list[Role]] = relationship(secondary=role_permissions, back_populates="permissions")
+
+
+# =============================================================================
+# SSO Provider Configuration
+# =============================================================================
+
+
+class SsoProvider(Base):
+    """SSO identity provider configuration (OIDC, OAuth2, SAML, Feishu, etc.)."""
+
+    __tablename__ = "sso_providers"
+    __table_args__ = (
+        Index("idx_sso_tenant_name", "tenant_id", "name", unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    provider_type: Mapped[str] = mapped_column(String(32), nullable=False)  # oidc | oauth2 | saml | feishu | dingtalk | wecom
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    client_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    client_secret_encrypted: Mapped[str] = mapped_column(String(1024), nullable=False)
+    issuer_url: Mapped[str | None] = mapped_column(String(512))
+    redirect_uri: Mapped[str | None] = mapped_column(String(512))
+    scopes: Mapped[list] = mapped_column(JSON, default=list)
+    extra_config: Mapped[dict] = mapped_column(JSON, default=dict)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

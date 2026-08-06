@@ -17,7 +17,6 @@ dependencies = [
     # Database
     "sqlalchemy[asyncio]>=2.0.35",
     "asyncpg>=0.30.0",
-    "alembic>=1.13.0",
     # Cache & Queue
     "redis>=5.1.0",
     # LLM Providers
@@ -90,3 +89,16 @@ known-first-party = ["ai_platform"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["src/ai_platform"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+fail_under = 40
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__",
+    "raise NotImplementedError",
+]

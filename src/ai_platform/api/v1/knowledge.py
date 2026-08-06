@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
+from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.chat import ChatCompletionRequest, ChatMessage
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
 from ai_platform.core.knowledge.engine import KnowledgeEngine
@@ -26,11 +27,20 @@ router = APIRouter()
 
 
 class KBCreateRequest(BaseModel):
-    name: str = Field(max_length=128)
-    description: str | None = None
-    embedding_model: str = Field(default="text-embedding-3-small")
+    name: str = Field(max_length=128, min_length=1)
+    description: str | None = Field(default=None, max_length=1000)
+    embedding_model: str = Field(default="text-embedding-3-small", max_length=100)
     chunk_size: int = Field(default=512, ge=100, le=2000)
     chunk_overlap: int = Field(default=64, ge=0, le=500)
+
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Validate KB name - reject suspicious patterns."""
+        # Reject SQL-like patterns
+        suspicious = ["'", '"', ";", "--", "/*", "*/"]
+        if any(pattern in v for pattern in suspicious):
+            raise ValueError("Name contains invalid characters")
+        return v
 
 
 class KBOut(BaseModel):
@@ -56,11 +66,11 @@ class DocOut(BaseModel):
 
 
 class KBQueryRequest(BaseModel):
-    question: str
+    question: str = Field(max_length=10000, min_length=1)
     top_k: int = Field(default=5, ge=1, le=20)
     score_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
     generate_answer: bool = Field(default=True, description="Use LLM to generate answer from chunks")
-    model: str = Field(default="gpt-4o")
+    model: str = Field(default="gpt-4o", max_length=100)
 
 
 class RetrievedChunkOut(BaseModel):
@@ -75,7 +85,7 @@ class RetrievedChunkOut(BaseModel):
 # =============================================================================
 
 
-@router.post("/", response_model=ApiResponse[KBOut])
+@router.post("/", response_model=ApiResponse[KBOut], dependencies=[Depends(require_permission("knowledge.write"))])
 async def create_knowledge_base(
     req: KBCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -104,7 +114,7 @@ async def create_knowledge_base(
     ))
 
 
-@router.get("/", response_model=ApiResponse[PaginatedResponse[KBOut]])
+@router.get("/", response_model=ApiResponse[PaginatedResponse[KBOut]], dependencies=[Depends(require_permission("knowledge.read"))])
 async def list_knowledge_bases(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
@@ -136,7 +146,7 @@ async def list_knowledge_bases(
     return ApiResponse(data=PaginatedResponse(items=items, total=total, page=page, page_size=page_size))
 
 
-@router.get("/{kb_id}", response_model=ApiResponse[KBOut])
+@router.get("/{kb_id}", response_model=ApiResponse[KBOut], dependencies=[Depends(require_permission("knowledge.read"))])
 async def get_knowledge_base(
     kb_id: uuid.UUID,
     ctx: RequestContext = Depends(get_request_context),
@@ -154,7 +164,7 @@ async def get_knowledge_base(
     ))
 
 
-@router.delete("/{kb_id}", response_model=ApiResponse)
+@router.delete("/{kb_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("knowledge.write"))])
 async def delete_knowledge_base(
     kb_id: uuid.UUID,
     ctx: RequestContext = Depends(get_request_context),
@@ -175,7 +185,7 @@ async def delete_knowledge_base(
 # =============================================================================
 
 
-@router.post("/{kb_id}/documents", response_model=ApiResponse[DocOut])
+@router.post("/{kb_id}/documents", response_model=ApiResponse[DocOut], dependencies=[Depends(require_permission("knowledge.write"))])
 async def upload_document(
     kb_id: uuid.UUID,
     file: UploadFile = File(...),
@@ -213,7 +223,7 @@ async def upload_document(
     ))
 
 
-@router.get("/{kb_id}/documents", response_model=ApiResponse[list[DocOut]])
+@router.get("/{kb_id}/documents", response_model=ApiResponse[list[DocOut]], dependencies=[Depends(require_permission("knowledge.read"))])
 async def list_documents(
     kb_id: uuid.UUID,
     ctx: RequestContext = Depends(get_request_context),
@@ -243,7 +253,7 @@ async def list_documents(
 # =============================================================================
 
 
-@router.post("/{kb_id}/query", response_model=ApiResponse)
+@router.post("/{kb_id}/query", response_model=ApiResponse, dependencies=[Depends(require_permission("knowledge.read"))])
 async def query_knowledge_base(
     kb_id: uuid.UUID,
     req: KBQueryRequest,
