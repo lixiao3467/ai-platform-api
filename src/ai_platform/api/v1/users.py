@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 import bcrypt
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -17,6 +17,7 @@ from ai_platform.api.middleware.auth import (
 )
 from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
+from ai_platform.api.v1._shared import IdRequest, validate_uuid
 from ai_platform.domain.models import Permission, Role, User, role_permissions, user_roles
 from ai_platform.infra.database.connection import get_db
 
@@ -41,6 +42,11 @@ roles_router = APIRouter()
 # =============================================================================
 
 
+class UserListRequest(BaseModel):
+    page: int = 1
+    page_size: int = 20
+
+
 class UserCreateRequest(BaseModel):
     username: str = Field(min_length=2, max_length=64)
     email: str = Field(max_length=128)
@@ -51,6 +57,7 @@ class UserCreateRequest(BaseModel):
 
 
 class UserUpdateRequest(BaseModel):
+    id: str
     display_name: str | None = None
     phone: str | None = None
     email: str | None = None
@@ -58,7 +65,12 @@ class UserUpdateRequest(BaseModel):
     role_ids: list[str] | None = None
 
 
+class UserDeleteRequest(BaseModel):
+    id: str
+
+
 class ResetPasswordRequest(BaseModel):
+    id: str
     new_password: str = Field(min_length=6)
 
 
@@ -82,9 +94,14 @@ class RoleCreateRequest(BaseModel):
 
 
 class RoleUpdateRequest(BaseModel):
+    id: str
     name: str | None = None
     description: str | None = None
     permission_ids: list[str] | None = None
+
+
+class RoleDeleteRequest(BaseModel):
+    id: str
 
 
 class RoleOut(BaseModel):
@@ -109,14 +126,15 @@ class PermissionOut(BaseModel):
 # =============================================================================
 
 
-@users_router.get("/", response_model=ApiResponse[PaginatedResponse[UserOut]], dependencies=[Depends(require_permission("user.manage"))])
+@users_router.post("/list", response_model=ApiResponse[PaginatedResponse[UserOut]], dependencies=[Depends(require_permission("user.manage"))])
 async def list_users(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
+    req: UserListRequest = UserListRequest(),
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """用户列表。"""
+    page = req.page
+    page_size = req.page_size
     offset = (page - 1) * page_size
     stmt = (
         select(User)
@@ -139,7 +157,7 @@ async def list_users(
     ))
 
 
-@users_router.post("/", response_model=ApiResponse[UserOut], dependencies=[Depends(require_permission("user.manage"))])
+@users_router.post("/create", response_model=ApiResponse[UserOut], dependencies=[Depends(require_permission("user.manage"))])
 async def create_user(
     req: UserCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -184,14 +202,14 @@ async def create_user(
     return ApiResponse(data=_user_to_out(user))
 
 
-@users_router.put("/{user_id}", response_model=ApiResponse[UserOut], dependencies=[Depends(require_permission("user.update"))])
+@users_router.post("/update", response_model=ApiResponse[UserOut], dependencies=[Depends(require_permission("user.update"))])
 async def update_user(
-    user_id: uuid.UUID,
     req: UserUpdateRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """更新用户信息。"""
+    user_id = validate_uuid(req.id)
     stmt = select(User).where(User.id == user_id, User.tenant_id == ctx.tenant_id).options(selectinload(User.roles))
     user = (await session.execute(stmt)).scalars().first()
     if not user:
@@ -219,13 +237,14 @@ async def update_user(
     return ApiResponse(data=_user_to_out(user))
 
 
-@users_router.delete("/{user_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("user.delete"))])
+@users_router.post("/delete", response_model=ApiResponse, dependencies=[Depends(require_permission("user.delete"))])
 async def delete_user(
-    user_id: uuid.UUID,
+    req: UserDeleteRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """删除用户。"""
+    user_id = validate_uuid(req.id)
     stmt = select(User).where(User.id == user_id, User.tenant_id == ctx.tenant_id)
     user = (await session.execute(stmt)).scalars().first()
     if not user:
@@ -237,14 +256,14 @@ async def delete_user(
     return ApiResponse(message="用户已删除")
 
 
-@users_router.post("/{user_id}/reset-password", response_model=ApiResponse, dependencies=[Depends(require_permission("user.update"))])
+@users_router.post("/reset-password", response_model=ApiResponse, dependencies=[Depends(require_permission("user.update"))])
 async def reset_password(
-    user_id: uuid.UUID,
     req: ResetPasswordRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """重置用户密码。"""
+    user_id = validate_uuid(req.id)
     stmt = select(User).where(User.id == user_id, User.tenant_id == ctx.tenant_id)
     user = (await session.execute(stmt)).scalars().first()
     if not user:
@@ -260,7 +279,7 @@ async def reset_password(
 # =============================================================================
 
 
-@roles_router.get("/", response_model=ApiResponse[list[RoleOut]], dependencies=[Depends(require_permission("user.manage"))])
+@roles_router.post("/list", response_model=ApiResponse[list[RoleOut]], dependencies=[Depends(require_permission("user.manage"))])
 async def list_roles(
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
@@ -293,7 +312,7 @@ async def list_roles(
     return ApiResponse(data=items)
 
 
-@roles_router.post("/", response_model=ApiResponse[RoleOut], dependencies=[Depends(require_permission("user.manage"))])
+@roles_router.post("/create", response_model=ApiResponse[RoleOut], dependencies=[Depends(require_permission("user.manage"))])
 async def create_role(
     req: RoleCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -326,14 +345,14 @@ async def create_role(
     ))
 
 
-@roles_router.put("/{role_id}", response_model=ApiResponse[RoleOut], dependencies=[Depends(require_permission("user.manage"))])
+@roles_router.post("/update", response_model=ApiResponse[RoleOut], dependencies=[Depends(require_permission("user.manage"))])
 async def update_role(
-    role_id: uuid.UUID,
     req: RoleUpdateRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """更新角色。"""
+    role_id = validate_uuid(req.id)
     stmt = select(Role).where(Role.id == role_id, Role.tenant_id == ctx.tenant_id).options(selectinload(Role.permissions))
     role = (await session.execute(stmt)).scalars().first()
     if not role:
@@ -353,13 +372,14 @@ async def update_role(
     return ApiResponse(message="角色已更新")
 
 
-@roles_router.delete("/{role_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("user.manage"))])
+@roles_router.post("/delete", response_model=ApiResponse, dependencies=[Depends(require_permission("user.manage"))])
 async def delete_role(
-    role_id: uuid.UUID,
+    req: RoleDeleteRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """删除角色（系统角色不可删除）。"""
+    role_id = validate_uuid(req.id)
     stmt = select(Role).where(Role.id == role_id, Role.tenant_id == ctx.tenant_id)
     role = (await session.execute(stmt)).scalars().first()
     if not role:
@@ -376,7 +396,7 @@ async def delete_role(
 # =============================================================================
 
 
-@roles_router.get("/permissions", response_model=ApiResponse[list[PermissionOut]], dependencies=[Depends(require_permission("user.manage"))])
+@roles_router.post("/permissions/list", response_model=ApiResponse[list[PermissionOut]], dependencies=[Depends(require_permission("user.manage"))])
 async def list_permissions(
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),

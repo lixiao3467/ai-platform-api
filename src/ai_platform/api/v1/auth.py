@@ -374,7 +374,7 @@ async def switch_role(
     ))
 
 
-@auth_router.get(
+@auth_router.post(
     "/me",
     response_model=ApiResponse[dict],
     summary="获取当前用户信息",

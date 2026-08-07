@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -91,8 +91,23 @@ class MemberInviteRequest(BaseModel):
     role_ids: list[str] = Field(default_factory=list)
 
 
+class MemberRemoveRequest(BaseModel):
+    id: str
+
+
 class MemberRoleUpdateRequest(BaseModel):
+    id: str
     role_ids: list[str]
+
+
+class ModelListRequest(BaseModel):
+    purpose: str | None = None
+
+
+class AuditLogListRequest(BaseModel):
+    page: int = 1
+    page_size: int = 20
+    action: str | None = None
 
 
 class ModelAccessOut(BaseModel):
@@ -148,8 +163,8 @@ class AuditLogOut(BaseModel):
 # =============================================================================
 
 
-@router.get(
-    "/self",
+@router.post(
+    "/self/get",
     response_model=ApiResponse[TenantSelfOut],
     summary="获取当前租户信息",
     dependencies=[Depends(require_permission("tenant.config"))],
@@ -180,8 +195,8 @@ async def get_tenant_self(
     ))
 
 
-@router.put(
-    "/self",
+@router.post(
+    "/self/update",
     response_model=ApiResponse[TenantSelfOut],
     summary="更新租户基本信息",
     dependencies=[Depends(require_permission("tenant.config"))],
@@ -222,7 +237,7 @@ async def update_tenant_self(
     ))
 
 
-@router.get(
+@router.post(
     "/self/usage",
     response_model=ApiResponse[UsageOut],
     summary="查看自己的用量",
@@ -256,19 +271,19 @@ async def get_tenant_usage(
     ))
 
 
-@router.get(
-    "/self/members",
+@router.post(
+    "/self/members/list",
     response_model=ApiResponse[PaginatedResponse[MemberOut]],
     summary="查看成员列表",
     dependencies=[Depends(require_permission("user.manage"))],
 )
 async def list_members(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """List all members (users) in the current tenant."""
+    page = 1
+    page_size = 20
     offset = (page - 1) * page_size
     stmt = (
         select(User)
@@ -303,7 +318,7 @@ async def list_members(
 
 
 @router.post(
-    "/self/members",
+    "/self/members/invite",
     response_model=ApiResponse[MemberOut],
     summary="邀请成员",
     status_code=201,
@@ -374,18 +389,19 @@ async def invite_member(
     ))
 
 
-@router.delete(
-    "/self/members/{user_id}",
+@router.post(
+    "/self/members/remove",
     response_model=ApiResponse,
     summary="移除成员",
     dependencies=[Depends(require_permission("user.manage"))],
 )
 async def remove_member(
-    user_id: uuid.UUID,
+    req: MemberRemoveRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Remove a user from the current tenant."""
+    user_id = uuid.UUID(req.id)
     user = await session.get(User, user_id)
     if not user or user.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Member not found")
@@ -398,19 +414,19 @@ async def remove_member(
     return ApiResponse(message="Member removed")
 
 
-@router.put(
-    "/self/members/{user_id}/role",
+@router.post(
+    "/self/members/update-role",
     response_model=ApiResponse[MemberOut],
     summary="修改成员角色",
     dependencies=[Depends(require_permission("user.manage"))],
 )
 async def update_member_role(
-    user_id: uuid.UUID,
     req: MemberRoleUpdateRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Update a member's roles."""
+    user_id = uuid.UUID(req.id)
     stmt = select(User).where(User.id == user_id, User.tenant_id == ctx.tenant_id).options(selectinload(User.roles))
     result = await session.execute(stmt)
     user = result.scalars().first()
@@ -438,17 +454,14 @@ async def update_member_role(
     ))
 
 
-@router.get(
-    "/self/models",
+@router.post(
+    "/self/models/list",
     response_model=ApiResponse[list[TenantAvailableModel]],
     summary="查看可用模型",
     dependencies=[Depends(require_permission("model.read"))],
 )
 async def list_tenant_models(
-    purpose: str | None = Query(
-        default=None,
-        description="Filter by purpose: llm | embedding | vision | multimodal | general | chat",
-    ),
+    req: ModelListRequest = ModelListRequest(),
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
@@ -458,9 +471,10 @@ async def list_tenant_models(
     via :class:`ModelResolverService`.  Each ``(provider, model)`` pair
     becomes one entry in the response.
 
-    Optional query param:
-        ``?purpose=embedding`` — only return models tagged with that purpose.
+    Optional body field:
+        ``purpose: "embedding"`` — only return models tagged with that purpose.
     """
+    purpose = req.purpose
     # Validate purpose param early (so bad requests get a clean 400).
     if purpose is not None:
         if purpose not in VALID_PURPOSES:
@@ -575,20 +589,22 @@ async def list_tenant_models(
     )
 
 
-@router.get(
-    "/self/audit-logs",
+@router.post(
+    "/self/audit-logs/list",
     response_model=ApiResponse[PaginatedResponse[AuditLogOut]],
     summary="查看自己的审计日志",
     dependencies=[Depends(require_permission("audit.view"))],
 )
 async def get_tenant_audit_logs(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    action: str | None = Query(default=None),
+    req: AuditLogListRequest = AuditLogListRequest(),
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Get audit logs scoped to the current tenant."""
+    page = req.page
+    page_size = req.page_size
+    action = req.action
+
     conditions = [AuditLog.tenant_id == ctx.tenant_id]
     if action:
         conditions.append(AuditLog.action == action)
