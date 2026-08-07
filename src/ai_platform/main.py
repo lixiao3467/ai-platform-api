@@ -388,6 +388,9 @@ async def _ensure_wave1_columns() -> None:
         "ALTER TABLE model_providers ADD COLUMN IF NOT EXISTS last_test_success boolean",
         "ALTER TABLE model_providers ADD COLUMN IF NOT EXISTS last_test_latency_ms integer",
         "ALTER TABLE model_providers ADD COLUMN IF NOT EXISTS needs_retest boolean NOT NULL DEFAULT false",
+        # Make knowledge_bases.app_id nullable (was NOT NULL with a hardcoded fallback UUID).
+        # Safe to re-run: PostgreSQL errors if column is already nullable, caught below.
+        "ALTER TABLE knowledge_bases ALTER COLUMN app_id DROP NOT NULL",
     ]
 
     engine = get_engine()
