@@ -116,18 +116,10 @@ class ElasticsearchStore:
                 index=self._index_name,
                 body={
                     "query": {
-                        "script_score": {
-                            "query": {
-                                "multi_match": {
-                                    "query": query_text,
-                                    "fields": ["content"],
-                                    "type": "best_fields",
-                                }
-                            },
-                            "script": {
-                                "source": "cosineSimilarity(params.query_vector, 'embedding') + 1.0",
-                                "params": {"query_vector": query_embedding},
-                            },
+                        "multi_match": {
+                            "query": query_text,
+                            "fields": ["content"],
+                            "type": "best_fields",
                         }
                     },
                     "size": top_k,

@@ -13,6 +13,13 @@ from ai_platform.core.knowledge.chunkers.recursive import RecursiveChunker
 from ai_platform.core.knowledge.parsers.base import parse_document
 from ai_platform.domain.models import Document, DocumentChunk, KnowledgeBase
 
+try:
+    from ai_platform.core.knowledge.store.es_store import get_es_store
+    _ES_AVAILABLE = True
+except ImportError:
+    _ES_AVAILABLE = False
+    get_es_store = None
+
 logger = structlog.get_logger()
 
 
@@ -122,11 +129,10 @@ class KnowledgeEngine:
         milvus = await get_milvus_store(kb.collection_name, kb.embedding_model, dim=dim)
 
         # Ensure ES index exists for hybrid search
-        from ai_platform.core.knowledge.store.es_store import get_es_store
-
-        es_store = await get_es_store(str(kb.id))
-        if es_store:
-            await es_store.ensure_index(dim=dim)
+        if _ES_AVAILABLE:
+            es_store = await get_es_store(str(kb.id))
+            if es_store:
+                await es_store.ensure_index(dim=dim)
 
         chunk_records = []
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
@@ -148,21 +154,23 @@ class KnowledgeEngine:
             )
 
             # Also index into Elasticsearch for hybrid search
-            if es_store and es_store.is_available():
-                try:
-                    await es_store.index_chunk(
-                        chunk_id=chunk_id,
-                        content=chunk.content,
-                        embedding=embedding,
-                        metadata={
-                            "document_id": str(document.id),
-                            "kb_id": str(kb.id),
-                            "chunk_index": i,
-                            "filename": document.filename,
-                        },
-                    )
-                except Exception as e:
-                    logger.warning("ES index failed for chunk", error=str(e))
+            if _ES_AVAILABLE:
+                es_store = await get_es_store(str(kb.id))
+                if es_store and es_store.is_available():
+                    try:
+                        await es_store.index_chunk(
+                            chunk_id=chunk_id,
+                            content=chunk.content,
+                            embedding=embedding,
+                            metadata={
+                                "document_id": str(document.id),
+                                "kb_id": str(kb.id),
+                                "chunk_index": i,
+                                "filename": document.filename,
+                            },
+                        )
+                    except Exception as e:
+                        logger.warning("ES index failed for chunk", error=str(e))
 
             # Create PostgreSQL record
             chunk_record = DocumentChunk(
@@ -231,15 +239,14 @@ class KnowledgeEngine:
             )
 
             # Hybrid search: also query Elasticsearch and merge with RRF
-            from ai_platform.core.knowledge.store.es_store import get_es_store
-
-            es_store = await get_es_store(str(kb_id))
             es_results = []
-            if es_store and es_store.is_available():
-                try:
-                    es_results = await es_store.search(question, query_embedding, top_k=top_k)
-                except Exception as e:
-                    logger.warning("ES search failed", error=str(e))
+            if _ES_AVAILABLE:
+                es_store = await get_es_store(str(kb_id))
+                if es_store and es_store.is_available():
+                    try:
+                        es_results = await es_store.search(question, query_embedding, top_k=top_k)
+                    except Exception as e:
+                        logger.warning("ES search failed", error=str(e))
 
             merged = _rrf_merge(results, es_results, k=60, top_k=top_k)
 
