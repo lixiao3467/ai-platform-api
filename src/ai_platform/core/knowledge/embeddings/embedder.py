@@ -92,8 +92,12 @@ async def create_embedder(
             )
 
             if config is not None:
-                # Prefix provider name only when routing through LiteLLM proxy.
-                # Direct API calls (e.g. DashScope) pass the model name as-is.
+                # LiteLLM aembedding() always needs a provider prefix to know
+                # how to format the request.  For LiteLLM-proxy traffic we use
+                # the real provider name; for direct API calls (e.g. DashScope
+                # /compatible-mode/v1) we use "openai/" since the endpoint is
+                # OpenAI-compatible.  Either way the custom api_base tells
+                # LiteLLM where to actually send the request.
                 model_name = config.model_name
                 if (
                     "/" not in model_name
@@ -101,8 +105,12 @@ async def create_embedder(
                     and config.provider_name != "env"
                 ):
                     settings = get_settings()
-                    if not config.api_base_url or config.api_base_url == settings.litellm_api_base:
-                        model_name = f"{config.provider_name}/{model_name}"
+                    is_litellm_proxy = (
+                        not config.api_base_url
+                        or config.api_base_url == settings.litellm_api_base
+                    )
+                    prefix = config.provider_name if is_litellm_proxy else "openai"
+                    model_name = f"{prefix}/{model_name}"
 
                 logger.info(
                     "Embedder resolved from DB",
