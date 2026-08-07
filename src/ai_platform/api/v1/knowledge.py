@@ -11,7 +11,7 @@ from pathlib import Path
 import structlog
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, update as sa_update
+from sqlalchemy import func, select, delete, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
@@ -226,20 +226,45 @@ async def _process_document(
             dim = len(embeddings[0]) if embeddings else None
             milvus = await get_milvus_store(kb.collection_name, kb.embedding_model, dim=dim)
 
+            # Ensure ES index exists for hybrid search
+            from ai_platform.core.knowledge.store.es_store import get_es_store
+
+            es_store = await get_es_store(str(kb.id))
+            if es_store:
+                await es_store.ensure_index(dim=dim)
+
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                 vector_id = f"{doc.id}_{chunk.metadata.get('chunk_index', i)}"
+                chunk_id = str(uuid.uuid4())
                 await milvus.insert(
                     collection_name=kb.collection_name,
                     vector_id=vector_id,
                     embedding=embedding,
                     metadata={
-                        "chunk_id": str(uuid.uuid4()),
+                        "chunk_id": chunk_id,
                         "document_id": str(doc.id),
                         "kb_id": str(kb.id),
                         "chunk_index": chunk.metadata.get("chunk_index", i),
                         "content": chunk.content,
                     },
                 )
+
+                # Also index into Elasticsearch for hybrid search
+                if es_store and es_store.is_available():
+                    try:
+                        await es_store.index_chunk(
+                            chunk_id=chunk_id,
+                            content=chunk.content,
+                            embedding=embedding,
+                            metadata={
+                                "document_id": str(doc.id),
+                                "kb_id": str(kb.id),
+                                "chunk_index": chunk.metadata.get("chunk_index", i),
+                                "filename": doc.filename,
+                            },
+                        )
+                    except Exception as e:
+                        logger.warning("ES index failed for chunk", error=str(e))
 
                 db_chunk = DocumentChunk(
                     id=uuid.uuid4(),
@@ -437,20 +462,39 @@ async def delete_knowledge_base(
     if not kb or kb.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
 
-    # Clean up Milvus collection first
+    # 1. Clean ES index
     try:
-        from ai_platform.core.knowledge.store.milvus_store import get_milvus_store
+        from ai_platform.core.knowledge.store.es_store import get_es_store
+
+        es_store = await get_es_store(str(kb.id))
+        if es_store and es_store.is_available():
+            await es_store.delete_index()
+    except Exception as e:
+        logger.warning("ES cleanup failed during KB delete", kb_id=str(kb_id), error=str(e))
+
+    # 2. Clean Milvus collection
+    try:
+        from ai_platform.core.knowledge.store.milvus_store import get_milvus_store, _store_cache
+
         store = await get_milvus_store(kb.collection_name, kb.embedding_model)
         await store.delete_collection(kb.collection_name)
+        _store_cache.pop(kb.collection_name, None)
     except Exception as e:
         logger.warning("Milvus cleanup failed during KB delete", kb_id=str(kb_id), error=str(e))
 
-    # Clean up stored files for all documents in this KB
+    # 3. Delete DocumentChunk rows (child first)
+    await session.execute(delete(DocumentChunk).where(DocumentChunk.kb_id == kb_id))
+
+    # 4. Delete Document rows + cleanup files
     docs_result = await session.execute(select(Document).where(Document.kb_id == kb_id))
     for doc in docs_result.scalars().all():
         _cleanup_document_files(doc)
+        await session.delete(doc)
 
+    # 5. Delete KB
     await session.delete(kb)
+    await session.flush()
+
     return ApiResponse(message="Knowledge base deleted")
 
 
@@ -678,6 +722,15 @@ async def delete_document(
         await store.delete_by_filter(kb.collection_name, f'document_id == "{str(doc.id)}"')
     except Exception as e:
         logger.warning("Milvus delete failed", doc_id=str(doc.id), error=str(e))
+
+    # 1.5 Remove chunks from Elasticsearch
+    try:
+        from ai_platform.core.knowledge.store.es_store import get_es_store
+        es_store = await get_es_store(str(kb.id))
+        if es_store and es_store.is_available():
+            await es_store.delete_by_document_id(str(doc.id))
+    except Exception as e:
+        logger.warning("ES delete failed", doc_id=str(doc.id), error=str(e))
 
     # 2. Compute chunk count to update KB stats
     removed_chunks = doc.chunk_count or 0

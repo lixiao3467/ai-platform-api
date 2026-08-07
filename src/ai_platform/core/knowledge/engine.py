@@ -27,6 +27,28 @@ class RetrievedChunk:
     metadata: dict
 
 
+def _rrf_merge(
+    milvus_results: list[dict],
+    es_results: list[dict],
+    k: int = 60,
+    top_k: int = 5,
+) -> list[dict]:
+    """Merge Milvus and Elasticsearch results using Reciprocal Rank Fusion (RRF)."""
+    scores: dict[str, float] = {}
+    metadata: dict[str, dict] = {}
+    for rank, hit in enumerate(milvus_results):
+        cid = hit.get("metadata", {}).get("chunk_id", "")
+        scores[cid] = scores.get(cid, 0) + 1.0 / (k + rank + 1)
+        metadata[cid] = hit
+    for rank, hit in enumerate(es_results):
+        cid = hit.get("metadata", {}).get("chunk_id", "")
+        scores[cid] = scores.get(cid, 0) + 1.0 / (k + rank + 1)
+        if cid not in metadata:
+            metadata[cid] = hit
+    sorted_ids = sorted(scores, key=scores.get, reverse=True)[:top_k]
+    return [metadata[cid] for cid in sorted_ids]
+
+
 class KnowledgeEngine:
     """
     RAG Pipeline — document ingestion and knowledge retrieval.
@@ -99,23 +121,48 @@ class KnowledgeEngine:
         dim = len(embeddings[0]) if embeddings else None
         milvus = await get_milvus_store(kb.collection_name, kb.embedding_model, dim=dim)
 
+        # Ensure ES index exists for hybrid search
+        from ai_platform.core.knowledge.store.es_store import get_es_store
+
+        es_store = await get_es_store(str(kb.id))
+        if es_store:
+            await es_store.ensure_index(dim=dim)
+
         chunk_records = []
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
 
             # Store in Milvus
             vector_id = f"{document.id}_{i}"
+            chunk_id = str(uuid.uuid4())
             await milvus.insert(
                 collection_name=kb.collection_name,
                 vector_id=vector_id,
                 embedding=embedding,
                 metadata={
-                    "chunk_id": str(uuid.uuid4()),
+                    "chunk_id": chunk_id,
                     "document_id": str(document.id),
                     "kb_id": str(kb.id),
                     "chunk_index": i,
                     "content": chunk.content,
                 },
             )
+
+            # Also index into Elasticsearch for hybrid search
+            if es_store and es_store.is_available():
+                try:
+                    await es_store.index_chunk(
+                        chunk_id=chunk_id,
+                        content=chunk.content,
+                        embedding=embedding,
+                        metadata={
+                            "document_id": str(document.id),
+                            "kb_id": str(kb.id),
+                            "chunk_index": i,
+                            "filename": document.filename,
+                        },
+                    )
+                except Exception as e:
+                    logger.warning("ES index failed for chunk", error=str(e))
 
             # Create PostgreSQL record
             chunk_record = DocumentChunk(
@@ -183,7 +230,20 @@ class KnowledgeEngine:
                 top_k=top_k,
             )
 
-            for hit in results:
+            # Hybrid search: also query Elasticsearch and merge with RRF
+            from ai_platform.core.knowledge.store.es_store import get_es_store
+
+            es_store = await get_es_store(str(kb_id))
+            es_results = []
+            if es_store and es_store.is_available():
+                try:
+                    es_results = await es_store.search(question, query_embedding, top_k=top_k)
+                except Exception as e:
+                    logger.warning("ES search failed", error=str(e))
+
+            merged = _rrf_merge(results, es_results, k=60, top_k=top_k)
+
+            for hit in merged:
                 score = hit.get("score", 0)
                 if score < score_threshold:
                     continue
