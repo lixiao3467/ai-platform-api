@@ -13,8 +13,8 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -78,6 +78,19 @@ class ModelMetricsOut(BaseModel):
     models: list[ModelUsageEntry]
     period_start: str
     period_end: str
+
+
+# ---------------------------------------------------------------------------
+# Request schemas (POST body)
+# ---------------------------------------------------------------------------
+
+
+class ApiMetricsRequest(BaseModel):
+    minutes: int = Field(default=60, ge=1, le=1440, description="查询时间范围（分钟）")
+
+
+class ModelMetricsRequest(BaseModel):
+    minutes: int = Field(default=1440, ge=1, le=10080, description="查询时间范围（分钟），默认24h")
 
 
 # =============================================================================
@@ -146,7 +159,7 @@ def _get_system_metrics() -> dict:
     }
 
 
-@router.get(
+@router.post(
     "/system",
     response_model=ApiResponse[SystemMetricsOut],
     summary="系统指标",
@@ -165,7 +178,7 @@ async def get_system_metrics(
 # =============================================================================
 
 
-@router.get(
+@router.post(
     "/api",
     response_model=ApiResponse[ApiMetricsOut],
     summary="API 指标",
@@ -173,13 +186,13 @@ async def get_system_metrics(
     dependencies=[Depends(require_permission("metric.read"))],
 )
 async def get_api_metrics(
-    minutes: int = Query(default=60, ge=1, le=1440, description="查询时间范围（分钟）"),
+    req: ApiMetricsRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """API performance metrics — QPS, latency percentiles, error rate."""
     now = datetime.now(tz=timezone.utc)
-    since = now - timedelta(minutes=minutes)
+    since = now - timedelta(minutes=req.minutes)
 
     conditions = [
         AuditLog.tenant_id == ctx.tenant_id,
@@ -202,7 +215,7 @@ async def get_api_metrics(
     error_rate = (errors / total * 100) if total > 0 else 0
 
     # QPS = total requests / total seconds in period
-    period_seconds = minutes * 60
+    period_seconds = req.minutes * 60
     qps = total / period_seconds if period_seconds > 0 else 0
 
     # Latency percentiles — use ordered set for approximate P50/P95/P99
@@ -233,7 +246,7 @@ async def get_api_metrics(
 # =============================================================================
 
 
-@router.get(
+@router.post(
     "/models",
     response_model=ApiResponse[ModelMetricsOut],
     summary="模型使用指标",
@@ -241,7 +254,7 @@ async def get_api_metrics(
     dependencies=[Depends(require_permission("metric.read"))],
 )
 async def get_model_metrics(
-    minutes: int = Query(default=1440, ge=1, le=10080, description="查询时间范围（分钟），默认24h"),
+    req: ModelMetricsRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
@@ -249,7 +262,7 @@ async def get_model_metrics(
     from ai_platform.services.cost_service import calculate_cost
 
     now = datetime.now(tz=timezone.utc)
-    since = now - timedelta(minutes=minutes)
+    since = now - timedelta(minutes=req.minutes)
 
     conditions = [
         AuditLog.tenant_id == ctx.tenant_id,

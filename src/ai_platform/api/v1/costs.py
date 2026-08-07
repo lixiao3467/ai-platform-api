@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,34 +22,50 @@ class BudgetCheckRequest(BaseModel):
     monthly_budget_usd: float = Field(gt=0, description="Monthly budget in USD")
 
 
-@router.get("/summary", response_model=ApiResponse, dependencies=[Depends(require_permission("cost.read"))])
+class CostSummaryRequest(BaseModel):
+    start_date: datetime | None = Field(default=None, description="Start date filter")
+    end_date: datetime | None = Field(default=None, description="End date filter")
+    app_id: str | None = Field(default=None, description="Filter by app ID (UUID)")
+
+
+class DailyCostsRequest(BaseModel):
+    days: int = Field(default=30, ge=1, le=365, description="查询天数范围")
+
+
+class CostExportRequest(BaseModel):
+    days: int = Field(default=30, ge=1, le=365, description="导出最近 N 天的数据")
+    format: str = Field(default="csv", pattern="^(csv|json)$", description="导出格式")
+    app_id: str | None = Field(default=None, description="按应用过滤 (UUID)")
+
+
+@router.post("/summary", response_model=ApiResponse, dependencies=[Depends(require_permission("cost.read"))])
 async def get_cost_summary(
-    start_date: datetime | None = Query(default=None),
-    end_date: datetime | None = Query(default=None),
-    app_id: uuid.UUID | None = Query(default=None),
+    req: CostSummaryRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Get aggregated cost summary (by model, tokens, requests)."""
+    from uuid import UUID
+
     svc = CostService(session)
     summary = await svc.get_cost_summary(
         ctx.tenant_id,
-        start_date=start_date,
-        end_date=end_date,
-        app_id=app_id,
+        start_date=req.start_date,
+        end_date=req.end_date,
+        app_id=UUID(req.app_id) if req.app_id else None,
     )
     return ApiResponse(data=summary.__dict__)
 
 
-@router.get("/daily", response_model=ApiResponse, dependencies=[Depends(require_permission("cost.read"))])
+@router.post("/daily", response_model=ApiResponse, dependencies=[Depends(require_permission("cost.read"))])
 async def get_daily_costs(
-    days: int = Query(default=30, ge=1, le=365),
+    req: DailyCostsRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Get daily cost breakdown for the past N days."""
     svc = CostService(session)
-    daily = await svc.get_daily_costs(ctx.tenant_id, days=days)
+    daily = await svc.get_daily_costs(ctx.tenant_id, days=req.days)
     return ApiResponse(data=daily)
 
 
@@ -66,7 +81,7 @@ async def check_budget(
     return ApiResponse(data=result)
 
 
-@router.get(
+@router.post(
     "/export",
     summary="导出成本数据",
     description="将每日成本明细导出为 CSV 或 JSON。支持大数据量流式下载。",
@@ -76,17 +91,15 @@ async def check_budget(
     },
 )
 async def export_costs(
-    days: int = Query(default=30, ge=1, le=365, description="导出最近 N 天的数据"),
-    format: str = Query(default="csv", pattern="^(csv|json)$", description="导出格式"),
-    app_id: uuid.UUID | None = Query(default=None, description="按应用过滤"),
+    req: CostExportRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Export daily cost data as CSV or JSON (streaming)."""
     svc = CostService(session)
-    daily_data = await svc.get_daily_costs(ctx.tenant_id, days=days)
+    daily_data = await svc.get_daily_costs(ctx.tenant_id, days=req.days)
 
-    if format == "json":
+    if req.format == "json":
         import json
         import io
 
@@ -94,7 +107,7 @@ async def export_costs(
         return StreamingResponse(
             io.StringIO(content),
             media_type="application/json; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="costs-{days}days.json"'},
+            headers={"Content-Disposition": f'attachment; filename="costs-{req.days}days.json"'},
         )
 
     # CSV
@@ -102,7 +115,7 @@ async def export_costs(
     import io
 
     output = io.StringIO()
-    output.write("﻿")  # BOM for Excel
+    output.write("")  # BOM for Excel
     writer = csv.writer(output, lineterminator="\r\n")
     writer.writerow(["日期", "输入 Tokens", "输出 Tokens", "请求数", "预估费用 (USD)"])
     for row in daily_data:
@@ -119,7 +132,7 @@ async def export_costs(
         io.StringIO(output.getvalue()),
         media_type="text/csv; charset=utf-8",
         headers={
-            "Content-Disposition": f'attachment; filename="costs-{days}days.csv"',
+            "Content-Disposition": f'attachment; filename="costs-{req.days}days.csv"',
             "X-Accel-Buffering": "no",
         },
     )

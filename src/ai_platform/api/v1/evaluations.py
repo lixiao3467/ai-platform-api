@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
@@ -75,6 +75,11 @@ class EvalRunOut(BaseModel):
     duration_seconds: float
     model: str
     sample_results: list[SampleResultOut]
+
+
+class EvalExportRequest(BaseModel):
+    run_id: str
+    format: str = Field(default="csv", pattern="^(csv|json)$", description="导出格式")
 
 
 # =============================================================================
@@ -163,7 +168,7 @@ async def judge_single(
 
 
 @router.post(
-    "/{run_id}/export",
+    "/export",
     summary="导出评估结果",
     description="将评估运行结果导出为 CSV 或 JSON。包含每个样本的评分和汇总指标。",
     dependencies=[Depends(require_permission("evaluation.manage"))],
@@ -173,8 +178,7 @@ async def judge_single(
     },
 )
 async def export_evaluation(
-    run_id: str,
-    format: str = Query(default="csv", pattern="^(csv|json)$", description="导出格式"),
+    req: EvalExportRequest,
     ctx: RequestContext = Depends(get_request_context),
 ):
     """

@@ -132,7 +132,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
 
     app = FastAPI(
-        redirect_slashes=True,
+        redirect_slashes=False,
         title="AI Platform — 企业级 AI 中台",
         description="""
 ## 概述
