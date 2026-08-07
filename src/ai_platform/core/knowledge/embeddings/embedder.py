@@ -92,15 +92,17 @@ async def create_embedder(
             )
 
             if config is not None:
-                # Use a provider/model form when we have both pieces so that
-                # LiteLLM routes to the right provider directly.
+                # Prefix provider name only when routing through LiteLLM proxy.
+                # Direct API calls (e.g. DashScope) pass the model name as-is.
                 model_name = config.model_name
                 if (
                     "/" not in model_name
                     and config.provider_name
                     and config.provider_name != "env"
                 ):
-                    model_name = f"{config.provider_name}/{model_name}"
+                    settings = get_settings()
+                    if not config.api_base_url or config.api_base_url == settings.litellm_api_base:
+                        model_name = f"{config.provider_name}/{model_name}"
 
                 logger.info(
                     "Embedder resolved from DB",
