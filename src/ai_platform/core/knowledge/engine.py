@@ -238,19 +238,7 @@ class KnowledgeEngine:
                 top_k=top_k,
             )
 
-            # Hybrid search: also query Elasticsearch and merge with RRF
-            es_results = []
-            if _ES_AVAILABLE:
-                es_store = await get_es_store(str(kb_id))
-                if es_store and es_store.is_available():
-                    try:
-                        es_results = await es_store.search(question, query_embedding, top_k=top_k)
-                    except Exception as e:
-                        logger.warning("ES search failed", error=str(e))
-
-            merged = _rrf_merge(results, es_results, k=60, top_k=top_k)
-
-            for hit in merged:
+            for hit in results:
                 score = hit.get("score", 0)
                 if score < score_threshold:
                     continue
