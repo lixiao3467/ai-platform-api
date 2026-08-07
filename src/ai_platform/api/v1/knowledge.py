@@ -285,7 +285,7 @@ async def create_knowledge_base(
 
     kb = KnowledgeBase(
         id=uuid.uuid4(),
-        app_id=ctx.app_id or uuid.UUID("00000000-0000-0000-0000-000000000001"),
+        app_id=ctx.app_id,
         tenant_id=ctx.tenant_id,
         group_id=group_id_uuid,
         name=req.name,
