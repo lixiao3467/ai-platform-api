@@ -89,11 +89,15 @@ class KnowledgeEngine:
         from ai_platform.core.knowledge.store.milvus_store import get_milvus_store
 
         embedder = await create_embedder(self._tenant_id, self._db)
-        milvus = await get_milvus_store(kb.collection_name, kb.embedding_model)
 
         # Batch embedding for efficiency
         texts = [c.content for c in chunks]
         embeddings = await embedder.embed_batch(texts)
+
+        # Derive vector dimension from actual embedding output so the Milvus
+        # collection is created with the correct dimension for this model.
+        dim = len(embeddings[0]) if embeddings else None
+        milvus = await get_milvus_store(kb.collection_name, kb.embedding_model, dim=dim)
 
         chunk_records = []
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):

@@ -27,11 +27,12 @@ class MilvusStore:
     worker thread via ``asyncio.to_thread`` so the event loop is never blocked.
     """
 
-    def __init__(self, collection_name: str, embedding_model: str) -> None:
+    def __init__(self, collection_name: str, embedding_model: str, dim: int | None = None) -> None:
         settings = get_settings()
         self._uri = settings.milvus_uri
         self._token = settings.milvus_token
         self._collection_name = collection_name
+        self._dim = dim
         self._client: MilvusClient | None = None
 
     async def _get_client(self) -> MilvusClient:
@@ -56,7 +57,7 @@ class MilvusStore:
             return
 
         settings = get_settings()
-        dim = settings.embedding_dimensions
+        dim = self._dim or settings.embedding_dimensions
 
         schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=True)
         schema.add_field(field_name="id", datatype=DataType.VARCHAR, is_primary=True, max_length=128)
@@ -169,8 +170,8 @@ class MilvusStore:
 _store_cache: dict[str, MilvusStore] = {}
 
 
-async def get_milvus_store(collection_name: str, embedding_model: str) -> MilvusStore:
+async def get_milvus_store(collection_name: str, embedding_model: str, dim: int | None = None) -> MilvusStore:
     """Get or create a MilvusStore instance (cached by collection name)."""
     if collection_name not in _store_cache:
-        _store_cache[collection_name] = MilvusStore(collection_name, embedding_model)
+        _store_cache[collection_name] = MilvusStore(collection_name, embedding_model, dim=dim)
     return _store_cache[collection_name]

@@ -217,10 +217,14 @@ async def _process_document(
             from ai_platform.core.knowledge.store.milvus_store import get_milvus_store
 
             embedder = await create_embedder(tenant_id, db)
-            milvus = await get_milvus_store(kb.collection_name, kb.embedding_model)
 
             texts = [c.content for c in chunks]
             embeddings = await embedder.embed_batch(texts)
+
+            # Derive vector dimension from actual embedding output so the Milvus
+            # collection is created with the correct dimension for this model.
+            dim = len(embeddings[0]) if embeddings else None
+            milvus = await get_milvus_store(kb.collection_name, kb.embedding_model, dim=dim)
 
             for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                 vector_id = f"{doc.id}_{chunk.metadata.get('chunk_index', i)}"
