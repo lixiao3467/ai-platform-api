@@ -364,6 +364,43 @@ async def get_knowledge_base(
     ))
 
 
+class KBUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=128, min_length=1)
+    description: str | None = Field(default=None, max_length=1000)
+    embedding_model: str | None = Field(default=None, max_length=100)
+    group_id: str | None = Field(default=None, description="知识库分组 ID")
+
+
+@router.put("/{kb_id}", response_model=ApiResponse[KBOut], dependencies=[Depends(require_permission("knowledge.write"))])
+async def update_knowledge_base(
+    kb_id: uuid.UUID,
+    body: KBUpdateRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """Update knowledge base metadata."""
+    kb = await session.get(KnowledgeBase, kb_id)
+    if not kb or kb.tenant_id != ctx.tenant_id:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
+
+    updates = body.model_dump(exclude_unset=True)
+    if "group_id" in updates and updates["group_id"] is not None:
+        updates["group_id"] = uuid.UUID(updates["group_id"])
+
+    for k, v in updates.items():
+        setattr(kb, k, v)
+    await session.commit()
+    await session.refresh(kb)
+
+    return ApiResponse(data=KBOut(
+        id=kb.id, name=kb.name, description=kb.description,
+        embedding_model=kb.embedding_model, doc_count=kb.doc_count,
+        chunk_count=kb.chunk_count, status=kb.status,
+        group_id=str(kb.group_id) if kb.group_id else None,
+        created_at=kb.created_at.isoformat(),
+    ))
+
+
 @router.delete("/{kb_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("knowledge.write"))])
 async def delete_knowledge_base(
     kb_id: uuid.UUID,
