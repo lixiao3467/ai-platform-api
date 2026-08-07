@@ -87,11 +87,18 @@ class ApiKey(Base):
     __table_args__ = (
         # Composite index for fast API-key lookups (hot path in verify_api_key)
         Index("idx_api_key_hash_prefix", "key_hash", "key_prefix"),
+        # Tenant-scoped API key listings (tenant self-service)
+        Index("idx_api_key_tenant", "tenant_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    app_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("apps.id"), nullable=False
+    # Nullable so tenant-level keys (no app binding) can be stored.
+    app_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("apps.id"), nullable=True
+    )
+    # Tenant-level keys carry their tenant directly (no app required).
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True
     )
     key_prefix: Mapped[str] = mapped_column(String(12), nullable=False)
     # SHA-256 hex digest = 64 chars; sized to match, not over-allocate
@@ -99,13 +106,16 @@ class ApiKey(Base):
     name: Mapped[str | None] = mapped_column(String(64))
     # Permissions list (matches default=list)
     permissions: Mapped[list] = mapped_column(JSON, default=list)
+    # Tenant self-service key restrictions (nullable for legacy/app-scoped rows)
+    allowed_models: Mapped[list | None] = mapped_column(JSON, default=list, nullable=True)
+    ip_whitelist: Mapped[list | None] = mapped_column(JSON, default=list, nullable=True)
     rate_limit: Mapped[int] = mapped_column(Integer, default=1000)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    app: Mapped[App] = relationship(back_populates="api_keys")
+    app: Mapped[App | None] = relationship(back_populates="api_keys")
 
 
 # =============================================================================

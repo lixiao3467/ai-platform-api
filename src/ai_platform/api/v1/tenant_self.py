@@ -10,6 +10,8 @@ Provides endpoints for tenant administrators to manage their own tenant:
 
 from __future__ import annotations
 
+import hashlib
+import secrets
 import uuid
 from datetime import datetime, timezone
 
@@ -22,7 +24,9 @@ from sqlalchemy.orm import selectinload
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
 from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
+from ai_platform.api.v1._shared import IdRequest
 from ai_platform.domain.models import (
+    ApiKey,
     App,
     AuditLog,
     Role,
@@ -156,6 +160,65 @@ class AuditLogOut(BaseModel):
     resource_id: str | None
     status_code: int | None
     created_at: str
+
+
+# =============================================================================
+# Tenant API Key schemas (self-service)
+# =============================================================================
+
+
+class TenantApiKeyOut(BaseModel):
+    """API key as seen by the tenant self-service UI (raw key never included)."""
+
+    id: str
+    name: str | None
+    key_prefix: str
+    permissions: list[str]
+    allowed_models: list[str]
+    ip_whitelist: list[str]
+    expires_at: str | None
+    last_used_at: str | None
+    created_at: str
+    is_enabled: bool
+
+
+class TenantApiKeyListRequest(BaseModel):
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=20, ge=1, le=100)
+
+
+class TenantApiKeyCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    permissions: list[str] = Field(default_factory=list)
+    allowed_models: list[str] | None = None
+    ip_whitelist: list[str] | None = None
+    expires_at: str | None = Field(default=None, description="ISO 8601 或 null")
+
+
+class TenantApiKeyUpdateRequest(BaseModel):
+    id: str
+    name: str | None = Field(default=None, max_length=64)
+    permissions: list[str] | None = None
+    allowed_models: list[str] | None = None
+    ip_whitelist: list[str] | None = None
+    expires_at: str | None = None
+
+
+class TenantApiKeyCreateResponse(BaseModel):
+    """Create response — includes the raw key (only time it is visible)."""
+
+    id: str
+    key: str
+    key_prefix: str
+    name: str | None
+
+
+class TenantApiKeyRotateResponse(BaseModel):
+    """Rotate response — includes the new raw key (only time it is visible)."""
+
+    id: str
+    new_key: str
+    key_prefix: str
 
 
 # =============================================================================
@@ -638,3 +701,230 @@ async def get_tenant_audit_logs(
     ]
 
     return ApiResponse(data=PaginatedResponse(items=items, total=total, page=page, page_size=page_size))
+
+
+# =============================================================================
+# Tenant API Key endpoints — /self/api-keys/*
+# =============================================================================
+# Tenant-scoped CRUD for the self-service API key UI. Unlike the global
+# ``/api-keys/*`` routes, these keys carry a ``tenant_id`` directly (no app
+# binding) and every query is constrained to the caller's tenant.
+
+
+def _generate_tenant_api_key() -> tuple[str, str, str]:
+    """Generate (raw_key, key_prefix, key_hash).
+
+    Mirrors ``api_keys._generate_api_key`` so the key format stays consistent.
+    """
+    raw_key = f"aiplat_{secrets.token_urlsafe(48)}"
+    key_prefix = raw_key[:12]
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    return raw_key, key_prefix, key_hash
+
+
+def _parse_expires_at(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="expires_at 格式错误，需要 ISO 8601")
+
+
+def _tenant_api_key_to_out(k: ApiKey) -> TenantApiKeyOut:
+    return TenantApiKeyOut(
+        id=str(k.id),
+        name=k.name,
+        key_prefix=k.key_prefix,
+        permissions=list(k.permissions or []),
+        allowed_models=list(getattr(k, "allowed_models", None) or []),
+        ip_whitelist=list(getattr(k, "ip_whitelist", None) or []),
+        expires_at=k.expires_at.isoformat() if k.expires_at else None,
+        last_used_at=k.last_used_at.isoformat() if k.last_used_at else None,
+        created_at=k.created_at.isoformat(),
+        is_enabled=bool(k.is_enabled),
+    )
+
+
+async def _get_tenant_api_key(session: AsyncSession, key_id: uuid.UUID, tenant_id: uuid.UUID) -> ApiKey:
+    stmt = select(ApiKey).where(ApiKey.id == key_id, ApiKey.tenant_id == tenant_id)
+    api_key = (await session.execute(stmt)).scalars().first()
+    if not api_key:
+        raise HTTPException(status_code=404, detail="API Key 不存在")
+    return api_key
+
+
+@router.post(
+    "/self/api-keys/list",
+    response_model=ApiResponse[PaginatedResponse[TenantApiKeyOut]],
+    summary="租户 API Key 列表",
+    description="获取当前租户的所有 API Key（不含原始密钥）。",
+    dependencies=[Depends(require_permission("apikey.manage"))],
+)
+async def list_tenant_api_keys(
+    req: TenantApiKeyListRequest = TenantApiKeyListRequest(),
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """List the current tenant's API keys (tenant-scoped, no app required)."""
+    conditions = [ApiKey.tenant_id == ctx.tenant_id]
+
+    total = (
+        await session.execute(select(func.count()).select_from(ApiKey).where(*conditions))
+    ).scalar() or 0
+
+    offset = (req.page - 1) * req.page_size
+    stmt = (
+        select(ApiKey)
+        .where(*conditions)
+        .order_by(ApiKey.created_at.desc())
+        .offset(offset)
+        .limit(req.page_size)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+
+    items = [_tenant_api_key_to_out(k) for k in rows]
+    return ApiResponse(
+        data=PaginatedResponse(items=items, total=total, page=req.page, page_size=req.page_size)
+    )
+
+
+@router.post(
+    "/self/api-keys/create",
+    response_model=ApiResponse[TenantApiKeyCreateResponse],
+    summary="创建租户 API Key",
+    description="创建新的租户级 API Key。原始密钥仅在此响应中返回一次，请妥善保存。",
+    status_code=201,
+    dependencies=[Depends(require_permission("apikey.manage"))],
+)
+async def create_tenant_api_key(
+    req: TenantApiKeyCreateRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """Create a tenant-level API key (no app binding)."""
+    raw_key, key_prefix, key_hash = _generate_tenant_api_key()
+    api_key = ApiKey(
+        id=uuid.uuid4(),
+        tenant_id=ctx.tenant_id,
+        app_id=None,
+        key_prefix=key_prefix,
+        key_hash=key_hash,
+        name=req.name,
+        permissions=req.permissions,
+        allowed_models=req.allowed_models or [],
+        ip_whitelist=req.ip_whitelist or [],
+        expires_at=_parse_expires_at(req.expires_at),
+        is_enabled=True,
+    )
+    session.add(api_key)
+    await session.flush()
+
+    return ApiResponse(
+        data=TenantApiKeyCreateResponse(
+            id=str(api_key.id),
+            key=raw_key,
+            key_prefix=key_prefix,
+            name=api_key.name,
+        )
+    )
+
+
+@router.post(
+    "/self/api-keys/update",
+    response_model=ApiResponse[TenantApiKeyOut],
+    summary="更新租户 API Key",
+    description="更新 API Key 的名称、权限、可用模型、IP 白名单或过期时间。",
+    dependencies=[Depends(require_permission("apikey.manage"))],
+)
+async def update_tenant_api_key(
+    req: TenantApiKeyUpdateRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """Update a tenant API key's metadata (not the key value)."""
+    api_key = await _get_tenant_api_key(session, uuid.UUID(req.id), ctx.tenant_id)
+
+    if req.name is not None:
+        api_key.name = req.name
+    if req.permissions is not None:
+        api_key.permissions = req.permissions
+    if req.allowed_models is not None:
+        api_key.allowed_models = req.allowed_models
+    if req.ip_whitelist is not None:
+        api_key.ip_whitelist = req.ip_whitelist
+    if req.expires_at is not None:
+        api_key.expires_at = _parse_expires_at(req.expires_at)
+
+    await session.flush()
+    return ApiResponse(data=_tenant_api_key_to_out(api_key))
+
+
+@router.post(
+    "/self/api-keys/delete",
+    response_model=ApiResponse,
+    summary="删除租户 API Key",
+    description="立即删除 API Key。使用该 Key 的集成将立即失效。",
+    dependencies=[Depends(require_permission("apikey.manage"))],
+)
+async def delete_tenant_api_key(
+    req: IdRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """Delete (revoke) a tenant API key."""
+    api_key = await _get_tenant_api_key(session, uuid.UUID(req.id), ctx.tenant_id)
+
+    # Best-effort Redis cache invalidation
+    try:
+        from ai_platform.infra.cache.redis_client import get_redis
+        redis = await get_redis()
+        await redis.delete(f"aip:key:{api_key.key_prefix}")
+    except Exception:
+        pass
+
+    await session.delete(api_key)
+    return ApiResponse(message="API Key 已删除")
+
+
+@router.post(
+    "/self/api-keys/rotate",
+    response_model=ApiResponse[TenantApiKeyRotateResponse],
+    summary="轮换租户 API Key",
+    description="生成新的密钥值，保留原有元数据。新密钥仅返回一次。",
+    dependencies=[Depends(require_permission("apikey.manage"))],
+)
+async def rotate_tenant_api_key(
+    req: IdRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """Rotate a tenant API key — replaces key_hash/key_prefix, keeps metadata.
+
+    The old key stops working immediately (no grace-period retention, which
+    would require an extra ``previous_key_hash`` column).
+    """
+    api_key = await _get_tenant_api_key(session, uuid.UUID(req.id), ctx.tenant_id)
+
+    old_prefix = api_key.key_prefix
+    raw_key, key_prefix, key_hash = _generate_tenant_api_key()
+    api_key.key_prefix = key_prefix
+    api_key.key_hash = key_hash
+    await session.flush()
+
+    # Invalidate cached entries for both old and new prefixes
+    try:
+        from ai_platform.infra.cache.redis_client import get_redis
+        redis = await get_redis()
+        await redis.delete(f"aip:key:{old_prefix}")
+        await redis.delete(f"aip:key:{key_prefix}")
+    except Exception:
+        pass
+
+    return ApiResponse(
+        data=TenantApiKeyRotateResponse(
+            id=str(api_key.id),
+            new_key=raw_key,
+            key_prefix=key_prefix,
+        )
+    )
