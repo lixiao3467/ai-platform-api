@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
 from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
+from ai_platform.api.v1._shared import IdRequest
 from ai_platform.core.workflow.engine import (
     EdgeDefinition,
     NodeDefinition,
@@ -67,7 +68,13 @@ class WorkflowDetailOut(WorkflowOut):
     variables: dict[str, Any]
 
 
-class WorkflowExecuteRequest(BaseModel):
+class WorkflowListRequest(BaseModel):
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=20, ge=1, le=100)
+
+
+class WorkflowExecuteBody(BaseModel):
+    id: str
     inputs: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -80,6 +87,10 @@ class ExecutionOut(BaseModel):
     completed_at: str | None
     error_message: str | None
     outputs: dict[str, Any] | None
+
+
+class ExecutionStepsListRequest(BaseModel):
+    execution_id: str
 
 
 class StepOut(BaseModel):
@@ -99,7 +110,7 @@ class StepOut(BaseModel):
 # =============================================================================
 
 
-@router.post("/", response_model=ApiResponse[WorkflowOut], dependencies=[Depends(require_permission("workflow.write"))])
+@router.post("/create", response_model=ApiResponse[WorkflowOut], dependencies=[Depends(require_permission("workflow.write"))])
 async def create_workflow(
     req: WorkflowCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -138,14 +149,15 @@ async def create_workflow(
     ))
 
 
-@router.get("/", response_model=ApiResponse[PaginatedResponse[WorkflowOut]], dependencies=[Depends(require_permission("workflow.read"))])
+@router.post("/list", response_model=ApiResponse[PaginatedResponse[WorkflowOut]], dependencies=[Depends(require_permission("workflow.read"))])
 async def list_workflows(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
+    req: WorkflowListRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """List workflows for the current tenant."""
+    page = req.page
+    page_size = req.page_size
     offset = (page - 1) * page_size
     query = (
         select(Workflow)
@@ -172,13 +184,14 @@ async def list_workflows(
     return ApiResponse(data=PaginatedResponse(items=items, total=total, page=page, page_size=page_size))
 
 
-@router.get("/{workflow_id}", response_model=ApiResponse[WorkflowDetailOut], dependencies=[Depends(require_permission("workflow.read"))])
+@router.post("/get", response_model=ApiResponse[WorkflowDetailOut], dependencies=[Depends(require_permission("workflow.read"))])
 async def get_workflow(
-    workflow_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Get workflow details including full DAG definition."""
+    workflow_id = uuid.UUID(req.id)
     w = await session.get(Workflow, workflow_id)
     if not w or w.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Workflow not found")
@@ -193,13 +206,14 @@ async def get_workflow(
     ))
 
 
-@router.post("/{workflow_id}/publish", response_model=ApiResponse, dependencies=[Depends(require_permission("workflow.write"))])
+@router.post("/publish", response_model=ApiResponse, dependencies=[Depends(require_permission("workflow.write"))])
 async def publish_workflow(
-    workflow_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Publish a workflow (make it executable)."""
+    workflow_id = uuid.UUID(req.id)
     w = await session.get(Workflow, workflow_id)
     if not w or w.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Workflow not found")
@@ -213,14 +227,14 @@ async def publish_workflow(
 # =============================================================================
 
 
-@router.post("/{workflow_id}/execute", response_model=ApiResponse[ExecutionOut], dependencies=[Depends(require_permission("workflow.write"))])
+@router.post("/execute", response_model=ApiResponse[ExecutionOut], dependencies=[Depends(require_permission("workflow.write"))])
 async def execute_workflow(
-    workflow_id: uuid.UUID,
-    req: WorkflowExecuteRequest,
+    req: WorkflowExecuteBody,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Execute a published workflow."""
+    workflow_id = uuid.UUID(req.id)
     w = await session.get(Workflow, workflow_id)
     if not w or w.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Workflow not found")
@@ -247,32 +261,14 @@ async def execute_workflow(
     ))
 
 
-@router.get("/executions/{exec_id}", response_model=ApiResponse[ExecutionOut], dependencies=[Depends(require_permission("workflow.read"))])
-async def get_execution(
-    exec_id: uuid.UUID,
-    ctx: RequestContext = Depends(get_request_context),
-    session: AsyncSession = Depends(get_db),
-):
-    """Get execution status."""
-    ex = await session.get(WorkflowExecution, exec_id)
-    if not ex or ex.tenant_id != ctx.tenant_id:
-        raise HTTPException(status_code=404, detail="Execution not found")
-    return ApiResponse(data=ExecutionOut(
-        id=ex.id, workflow_id=ex.workflow_id, status=ex.status,
-        current_node=ex.current_node,
-        started_at=ex.started_at.isoformat() if ex.started_at else "",
-        completed_at=ex.completed_at.isoformat() if ex.completed_at else None,
-        error_message=ex.error_message, outputs=ex.outputs,
-    ))
-
-
-@router.get("/executions/{exec_id}/steps", response_model=ApiResponse[list[StepOut]], dependencies=[Depends(require_permission("workflow.read"))])
+@router.post("/executions/steps/list", response_model=ApiResponse[list[StepOut]], dependencies=[Depends(require_permission("workflow.read"))])
 async def get_execution_steps(
-    exec_id: uuid.UUID,
+    req: ExecutionStepsListRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Get all steps for an execution."""
+    exec_id = uuid.UUID(req.execution_id)
     ex = await session.get(WorkflowExecution, exec_id)
     if not ex or ex.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Execution not found")
@@ -295,3 +291,23 @@ async def get_execution_steps(
         )
         for s in steps
     ])
+
+
+@router.post("/executions/get", response_model=ApiResponse[ExecutionOut], dependencies=[Depends(require_permission("workflow.read"))])
+async def get_execution(
+    req: IdRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """Get execution status."""
+    exec_id = uuid.UUID(req.id)
+    ex = await session.get(WorkflowExecution, exec_id)
+    if not ex or ex.tenant_id != ctx.tenant_id:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    return ApiResponse(data=ExecutionOut(
+        id=ex.id, workflow_id=ex.workflow_id, status=ex.status,
+        current_node=ex.current_node,
+        started_at=ex.started_at.isoformat() if ex.started_at else "",
+        completed_at=ex.completed_at.isoformat() if ex.completed_at else None,
+        error_message=ex.error_message, outputs=ex.outputs,
+    ))

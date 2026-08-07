@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
 from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
+from ai_platform.api.v1._shared import IdRequest
 from ai_platform.core.agent.runtime import AgentConfig, AgentRuntime
 from ai_platform.core.agent.tools.registry import get_tool_registry
 from ai_platform.domain.models import Agent
@@ -47,10 +48,39 @@ class AgentOut(BaseModel):
     created_at: str
 
 
-class AgentRunRequest(BaseModel):
+class AgentListRequest(BaseModel):
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=20, ge=1, le=100)
+
+
+class AgentRunBody(BaseModel):
+    id: str
     input: str = Field(description="User input for the agent")
     stream: bool = Field(default=False)
     context: dict | None = Field(default=None, description="Additional context")
+
+
+# =============================================================================
+# Tool Management — MUST be declared BEFORE id-based routes
+# =============================================================================
+
+
+@router.post("/tools/list", response_model=ApiResponse[list[dict]], dependencies=[Depends(require_permission("agent.read"))])
+async def list_tools(
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """List all available tools."""
+    registry = get_tool_registry()
+    tools = registry.list_tools()
+    return ApiResponse(data=[
+        {
+            "name": t.name,
+            "description": t.description,
+            "category": t.category,
+            "parameters": t.parameters,
+        }
+        for t in tools
+    ])
 
 
 # =============================================================================
@@ -58,7 +88,7 @@ class AgentRunRequest(BaseModel):
 # =============================================================================
 
 
-@router.post("/", response_model=ApiResponse[AgentOut], dependencies=[Depends(require_permission("agent.write"))])
+@router.post("/create", response_model=ApiResponse[AgentOut], dependencies=[Depends(require_permission("agent.write"))])
 async def create_agent(
     req: AgentCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -87,43 +117,15 @@ async def create_agent(
     ))
 
 
-# =============================================================================
-# Tool Management — MUST be declared BEFORE /{agent_id} routes
-# so FastAPI doesn't match "tools" as a UUID agent_id
-# =============================================================================
-
-
-@router.get("/tools", response_model=ApiResponse[list[dict]], dependencies=[Depends(require_permission("agent.read"))])
-async def list_tools(
-    ctx: RequestContext = Depends(get_request_context),
-):
-    """List all available tools."""
-    registry = get_tool_registry()
-    tools = registry.list_tools()
-    return ApiResponse(data=[
-        {
-            "name": t.name,
-            "description": t.description,
-            "category": t.category,
-            "parameters": t.parameters,
-        }
-        for t in tools
-    ])
-
-
-# =============================================================================
-# Agent CRUD (parameterized routes — declared AFTER fixed paths like /tools)
-# =============================================================================
-
-
-@router.get("/", response_model=ApiResponse[PaginatedResponse[AgentOut]], dependencies=[Depends(require_permission("agent.read"))])
+@router.post("/list", response_model=ApiResponse[PaginatedResponse[AgentOut]], dependencies=[Depends(require_permission("agent.read"))])
 async def list_agents(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
+    req: AgentListRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """List agents for the current tenant."""
+    page = req.page
+    page_size = req.page_size
     offset = (page - 1) * page_size
     query = (
         select(Agent)
@@ -147,13 +149,14 @@ async def list_agents(
     return ApiResponse(data=PaginatedResponse(items=items, total=total, page=page, page_size=page_size))
 
 
-@router.get("/{agent_id}", response_model=ApiResponse[AgentOut], dependencies=[Depends(require_permission("agent.read"))])
+@router.post("/get", response_model=ApiResponse[AgentOut], dependencies=[Depends(require_permission("agent.read"))])
 async def get_agent(
-    agent_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Get agent details."""
+    agent_id = uuid.UUID(req.id)
     agent = await session.get(Agent, agent_id)
     if not agent or agent.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -164,13 +167,14 @@ async def get_agent(
     ))
 
 
-@router.delete("/{agent_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("agent.write"))])
+@router.post("/delete", response_model=ApiResponse, dependencies=[Depends(require_permission("agent.write"))])
 async def delete_agent(
-    agent_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Delete an agent."""
+    agent_id = uuid.UUID(req.id)
     agent = await session.get(Agent, agent_id)
     if not agent or agent.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -183,10 +187,9 @@ async def delete_agent(
 # =============================================================================
 
 
-@router.post("/{agent_id}/run", dependencies=[Depends(require_permission("agent.execute"))])
+@router.post("/run", dependencies=[Depends(require_permission("agent.execute"))])
 async def run_agent(
-    agent_id: uuid.UUID,
-    req: AgentRunRequest,
+    req: AgentRunBody,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
@@ -195,6 +198,7 @@ async def run_agent(
 
     Supports streaming (stream=true) for real-time event output.
     """
+    agent_id = uuid.UUID(req.id)
     agent = await session.get(Agent, agent_id)
     if not agent or agent.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Agent not found")

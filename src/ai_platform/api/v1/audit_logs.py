@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,6 +56,24 @@ class AuditStatsOut(BaseModel):
     period_end: str
 
 
+class AuditLogListRequest(BaseModel):
+    page: int = Field(default=1, ge=1, description="页码（从1开始）")
+    page_size: int = Field(default=20, ge=1, le=100, description="每页条数")
+    user_id: str | None = Field(default=None, description="按操作人 ID 过滤")
+    action: str | None = Field(default=None, description="按操作类型过滤（如 chat.post, agent.delete）")
+    resource_type: str | None = Field(default=None, description="按资源类型过滤（如 agent, conversation）")
+    resource_id: str | None = Field(default=None, description="按资源 ID 过滤")
+    start_time: datetime | None = Field(default=None, description="开始时间（ISO 8601）")
+    end_time: datetime | None = Field(default=None, description="结束时间（ISO 8601）")
+    response_code_min: int | None = Field(default=None, ge=100, le=599, description="最小响应码（如 400 查错误）")
+    response_code_max: int | None = Field(default=None, ge=100, le=599, description="最大响应码（如 499）")
+
+
+class AuditStatsRequest(BaseModel):
+    start_time: datetime | None = Field(default=None, description="开始时间")
+    end_time: datetime | None = Field(default=None, description="结束时间")
+
+
 # =============================================================================
 # Action mapping for human-readable labels
 # =============================================================================
@@ -93,8 +111,8 @@ ACTION_LABELS: dict[str, str] = {
 # =============================================================================
 
 
-@router.get(
-    "/",
+@router.post(
+    "/list",
     response_model=ApiResponse[PaginatedResponse[AuditLogOut]],
     summary="查询审计日志",
     description="分页查询审计日志。支持按操作人、时间范围、操作类型、资源类型过滤。",
@@ -105,16 +123,7 @@ ACTION_LABELS: dict[str, str] = {
     },
 )
 async def list_audit_logs(
-    page: int = Query(default=1, ge=1, description="页码（从1开始）"),
-    page_size: int = Query(default=20, ge=1, le=100, description="每页条数"),
-    user_id: str | None = Query(default=None, description="按操作人 ID 过滤"),
-    action: str | None = Query(default=None, description="按操作类型过滤（如 chat.post, agent.delete）"),
-    resource_type: str | None = Query(default=None, description="按资源类型过滤（如 agent, conversation）"),
-    resource_id: str | None = Query(default=None, description="按资源 ID 过滤"),
-    start_time: datetime | None = Query(default=None, alias="start_time", description="开始时间（ISO 8601）"),
-    end_time: datetime | None = Query(default=None, alias="end_time", description="结束时间（ISO 8601）"),
-    response_code_min: int | None = Query(default=None, ge=100, le=599, description="最小响应码（如 400 查错误）"),
-    response_code_max: int | None = Query(default=None, ge=100, le=599, description="最大响应码（如 499）"),
+    req: AuditLogListRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
@@ -125,6 +134,9 @@ async def list_audit_logs(
     - 支持多维度过滤
     - 默认按时间倒序
     """
+    page = req.page
+    page_size = req.page_size
+
     # Base conditions: tenant isolation
     conditions = [AuditLog.tenant_id == ctx.tenant_id]
 
@@ -132,22 +144,22 @@ async def list_audit_logs(
         conditions.append(AuditLog.app_id == ctx.app_id)
 
     # Optional filters
-    if user_id:
-        conditions.append(AuditLog.user_id == user_id)
-    if action:
-        conditions.append(AuditLog.action == action)
-    if resource_type:
-        conditions.append(AuditLog.resource_type == resource_type)
-    if resource_id:
-        conditions.append(AuditLog.resource_id == resource_id)
-    if start_time:
-        conditions.append(AuditLog.created_at >= start_time)
-    if end_time:
-        conditions.append(AuditLog.created_at <= end_time)
-    if response_code_min is not None:
-        conditions.append(AuditLog.response_code >= response_code_min)
-    if response_code_max is not None:
-        conditions.append(AuditLog.response_code <= response_code_max)
+    if req.user_id:
+        conditions.append(AuditLog.user_id == req.user_id)
+    if req.action:
+        conditions.append(AuditLog.action == req.action)
+    if req.resource_type:
+        conditions.append(AuditLog.resource_type == req.resource_type)
+    if req.resource_id:
+        conditions.append(AuditLog.resource_id == req.resource_id)
+    if req.start_time:
+        conditions.append(AuditLog.created_at >= req.start_time)
+    if req.end_time:
+        conditions.append(AuditLog.created_at <= req.end_time)
+    if req.response_code_min is not None:
+        conditions.append(AuditLog.response_code >= req.response_code_min)
+    if req.response_code_max is not None:
+        conditions.append(AuditLog.response_code <= req.response_code_max)
 
     # Count total
     count_stmt = select(func.count()).select_from(AuditLog).where(and_(*conditions))
@@ -197,7 +209,7 @@ async def list_audit_logs(
     )
 
 
-@router.get(
+@router.post(
     "/stats",
     response_model=ApiResponse[AuditStatsOut],
     summary="审计统计",
@@ -205,8 +217,7 @@ async def list_audit_logs(
     dependencies=[Depends(require_permission("audit.view"))],
 )
 async def audit_stats(
-    start_time: datetime | None = Query(default=None, description="开始时间"),
-    end_time: datetime | None = Query(default=None, description="结束时间"),
+    req: AuditStatsRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
@@ -214,6 +225,8 @@ async def audit_stats(
     from datetime import datetime as dt, timedelta, timezone
 
     now = dt.now(tz=timezone.utc)
+    start_time = req.start_time
+    end_time = req.end_time
     if not end_time:
         end_time = now
     if not start_time:
@@ -274,8 +287,8 @@ async def audit_stats(
     )
 
 
-@router.get(
-    "/actions",
+@router.post(
+    "/actions/list",
     response_model=ApiResponse[dict],
     summary="可用操作类型列表",
     description="返回所有已记录的操作类型及其可读标签，用于前端下拉过滤。",

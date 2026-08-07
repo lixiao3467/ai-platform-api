@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
 from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse
+from ai_platform.api.v1._shared import IdRequest
 from ai_platform.domain.models import KnowledgeBase, KnowledgeGroup
 from ai_platform.infra.database.connection import get_db
 
@@ -31,7 +32,8 @@ class GroupCreateRequest(BaseModel):
     sort_order: int = Field(default=0)
 
 
-class GroupUpdateRequest(BaseModel):
+class GroupUpdateBody(BaseModel):
+    id: str
     name: str | None = Field(default=None, max_length=128, min_length=1)
     description: str | None = Field(default=None, max_length=1000)
     icon: str | None = Field(default=None, max_length=64)
@@ -101,7 +103,7 @@ async def _build_tree(
 
 
 @router.post(
-    "/",
+    "/create",
     response_model=ApiResponse[GroupOut],
     status_code=201,
     summary="创建知识库分组",
@@ -156,8 +158,8 @@ async def create_group(
     ))
 
 
-@router.get(
-    "/",
+@router.post(
+    "/list",
     response_model=ApiResponse[list[GroupOut]],
     summary="知识库分组列表（树形）",
     dependencies=[Depends(require_permission("knowledge.read"))],
@@ -189,19 +191,19 @@ async def list_groups(
     return ApiResponse(data=tree)
 
 
-@router.put(
-    "/{group_id}",
+@router.post(
+    "/update",
     response_model=ApiResponse[GroupOut],
     summary="更新知识库分组",
     dependencies=[Depends(require_permission("knowledge.write"))],
 )
 async def update_group(
-    group_id: uuid.UUID,
-    req: GroupUpdateRequest,
+    req: GroupUpdateBody,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """更新分组信息。"""
+    group_id = uuid.UUID(req.id)
     group = await session.get(KnowledgeGroup, group_id)
     if not group or group.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="分组不存在")
@@ -270,18 +272,19 @@ async def update_group(
     ))
 
 
-@router.delete(
-    "/{group_id}",
+@router.post(
+    "/delete",
     response_model=ApiResponse,
     summary="删除知识库分组",
     dependencies=[Depends(require_permission("knowledge.write"))],
 )
 async def delete_group(
-    group_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """删除分组。子分组的 parent_id 置空，KB 的 group_id 置空。"""
+    group_id = uuid.UUID(req.id)
     group = await session.get(KnowledgeGroup, group_id)
     if not group or group.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="分组不存在")

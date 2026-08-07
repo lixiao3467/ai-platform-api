@@ -12,7 +12,7 @@ import secrets
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
 from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
+from ai_platform.api.v1._shared import IdRequest
 from ai_platform.domain.models import ApiKey, App
 from ai_platform.infra.database.connection import get_db
 
@@ -39,7 +40,8 @@ class ApiKeyCreateRequest(BaseModel):
     expires_at: str | None = Field(default=None, description="Expiry time (ISO 8601) or null for no expiry")
 
 
-class ApiKeyUpdateRequest(BaseModel):
+class ApiKeyUpdateBody(BaseModel):
+    id: str
     name: str | None = None
     permissions: list[str] | None = None
     rate_limit: int | None = None
@@ -88,6 +90,17 @@ class ApiKeyStatsOut(BaseModel):
     last_used_at: str | None
 
 
+class ApiKeyListRequest(BaseModel):
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=20, ge=1, le=100)
+    app_id: str | None = Field(default=None, description="按应用过滤")
+
+
+class ApiKeyToggleRequest(BaseModel):
+    id: str
+    enabled: bool
+
+
 # =============================================================================
 # Key Generation
 # =============================================================================
@@ -110,70 +123,8 @@ def _generate_api_key() -> tuple[str, str, str]:
 # =============================================================================
 
 
-@router.get(
-    "/",
-    response_model=ApiResponse[PaginatedResponse[ApiKeyOut]],
-    summary="获取 API Key 列表",
-    description="获取当前租户所有 API Key（不包含原始密钥）。",
-    dependencies=[Depends(require_permission("apikey.manage"))],
-)
-async def list_api_keys(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    app_id: str | None = Query(default=None, description="按应用过滤"),
-    ctx: RequestContext = Depends(get_request_context),
-    session: AsyncSession = Depends(get_db),
-):
-    """List all API keys for the current tenant."""
-    conditions = [App.tenant_id == ctx.tenant_id]
-    if ctx.app_id:
-        conditions.append(ApiKey.app_id == ctx.app_id)
-    if app_id:
-        conditions.append(ApiKey.app_id == uuid.UUID(app_id))
-
-    # Count total
-    from sqlalchemy import join
-    join_clause = join(ApiKey, App, ApiKey.app_id == App.id)
-    count_stmt = select(func.count()).select_from(join_clause).where(*conditions)
-    total = (await session.execute(count_stmt)).scalar() or 0
-
-    # Fetch page
-    offset = (page - 1) * page_size
-    stmt = (
-        select(ApiKey, App.name.label("app_name"))
-        .join(App, ApiKey.app_id == App.id)
-        .where(*conditions)
-        .order_by(ApiKey.created_at.desc())
-        .offset(offset)
-        .limit(page_size)
-    )
-    result = await session.execute(stmt)
-    rows = result.all()
-
-    items = [
-        ApiKeyOut(
-            id=str(k.id),
-            app_id=str(k.app_id),
-            app_name=app_name,
-            name=k.name,
-            key_prefix=k.key_prefix,
-            permissions=k.permissions or [],
-            rate_limit=k.rate_limit,
-            is_enabled=k.is_enabled if hasattr(k, 'is_enabled') else True,
-            expires_at=k.expires_at.isoformat() if k.expires_at else None,
-            last_used_at=k.last_used_at.isoformat() if k.last_used_at else None,
-            created_at=k.created_at.isoformat(),
-        )
-        for k, app_name in rows
-    ]
-
-    return ApiResponse(
-        data=PaginatedResponse(items=items, total=total, page=page, page_size=page_size)
-    )
-
-
 @router.post(
-    "/",
+    "/create",
     response_model=ApiResponse[ApiKeyCreatedOut],
     summary="创建 API Key",
     description="创建新的 API Key。原始密钥仅在此响应中返回一次，请妥善保存。",
@@ -232,20 +183,84 @@ async def create_api_key(
     )
 
 
-@router.put(
-    "/{key_id}",
+@router.post(
+    "/list",
+    response_model=ApiResponse[PaginatedResponse[ApiKeyOut]],
+    summary="获取 API Key 列表",
+    description="获取当前租户所有 API Key（不包含原始密钥）。",
+    dependencies=[Depends(require_permission("apikey.manage"))],
+)
+async def list_api_keys(
+    req: ApiKeyListRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """List all API keys for the current tenant."""
+    page = req.page
+    page_size = req.page_size
+    app_id = req.app_id
+
+    conditions = [App.tenant_id == ctx.tenant_id]
+    if ctx.app_id:
+        conditions.append(ApiKey.app_id == ctx.app_id)
+    if app_id:
+        conditions.append(ApiKey.app_id == uuid.UUID(app_id))
+
+    # Count total
+    from sqlalchemy import join
+    join_clause = join(ApiKey, App, ApiKey.app_id == App.id)
+    count_stmt = select(func.count()).select_from(join_clause).where(*conditions)
+    total = (await session.execute(count_stmt)).scalar() or 0
+
+    # Fetch page
+    offset = (page - 1) * page_size
+    stmt = (
+        select(ApiKey, App.name.label("app_name"))
+        .join(App, ApiKey.app_id == App.id)
+        .where(*conditions)
+        .order_by(ApiKey.created_at.desc())
+        .offset(offset)
+        .limit(page_size)
+    )
+    result = await session.execute(stmt)
+    rows = result.all()
+
+    items = [
+        ApiKeyOut(
+            id=str(k.id),
+            app_id=str(k.app_id),
+            app_name=app_name,
+            name=k.name,
+            key_prefix=k.key_prefix,
+            permissions=k.permissions or [],
+            rate_limit=k.rate_limit,
+            is_enabled=k.is_enabled if hasattr(k, 'is_enabled') else True,
+            expires_at=k.expires_at.isoformat() if k.expires_at else None,
+            last_used_at=k.last_used_at.isoformat() if k.last_used_at else None,
+            created_at=k.created_at.isoformat(),
+        )
+        for k, app_name in rows
+    ]
+
+    return ApiResponse(
+        data=PaginatedResponse(items=items, total=total, page=page, page_size=page_size)
+    )
+
+
+@router.post(
+    "/update",
     response_model=ApiResponse[ApiKeyOut],
     summary="更新 API Key",
     description="更新 API Key 的名称、权限、速率限制或启用状态。",
     dependencies=[Depends(require_permission("apikey.manage"))],
 )
 async def update_api_key(
-    key_id: uuid.UUID,
-    req: ApiKeyUpdateRequest,
+    req: ApiKeyUpdateBody,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Update an API key's metadata (not the key itself)."""
+    key_id = uuid.UUID(req.id)
     stmt = select(ApiKey, App.name).join(App).where(
         ApiKey.id == key_id,
         App.tenant_id == ctx.tenant_id,
@@ -293,19 +308,20 @@ async def update_api_key(
     )
 
 
-@router.delete(
-    "/{key_id}",
+@router.post(
+    "/delete",
     response_model=ApiResponse,
     summary="删除 API Key",
     description="立即删除 API Key。使用该 Key 的集成将立即失效。",
     dependencies=[Depends(require_permission("apikey.manage"))],
 )
 async def delete_api_key(
-    key_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Delete (revoke) an API key."""
+    key_id = uuid.UUID(req.id)
     stmt = select(ApiKey).join(App).where(
         ApiKey.id == key_id,
         App.tenant_id == ctx.tenant_id,
@@ -328,18 +344,18 @@ async def delete_api_key(
 
 
 @router.post(
-    "/{key_id}/toggle",
+    "/toggle",
     response_model=ApiResponse[ApiKeyOut],
     summary="启用/禁用 API Key",
     dependencies=[Depends(require_permission("apikey.manage"))],
 )
 async def toggle_api_key(
-    key_id: uuid.UUID,
-    enabled: bool = Query(..., description="true=启用, false=禁用"),
+    req: ApiKeyToggleRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Enable or disable an API key."""
+    key_id = uuid.UUID(req.id)
     stmt = select(ApiKey, App.name).join(App).where(
         ApiKey.id == key_id,
         App.tenant_id == ctx.tenant_id,
@@ -350,7 +366,7 @@ async def toggle_api_key(
         raise HTTPException(status_code=404, detail="API Key 不存在")
 
     api_key, app_name = row
-    api_key.is_enabled = enabled
+    api_key.is_enabled = req.enabled
     await session.flush()
 
     # Invalidate Redis cache
@@ -378,15 +394,15 @@ async def toggle_api_key(
     )
 
 
-@router.get(
-    "/{key_id}/stats",
+@router.post(
+    "/stats",
     response_model=ApiResponse[ApiKeyStatsOut],
     summary="API Key 使用统计",
     description="获取指定 API Key 的请求量统计（24h/7d/30d）。",
     dependencies=[Depends(require_permission("apikey.manage"))],
 )
 async def get_api_key_stats(
-    key_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
@@ -395,6 +411,7 @@ async def get_api_key_stats(
 
     from ai_platform.domain.models import AuditLog
 
+    key_id = uuid.UUID(req.id)
     # Verify key belongs to tenant
     stmt = select(ApiKey).join(App).where(
         ApiKey.id == key_id,

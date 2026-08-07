@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
 from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
+from ai_platform.api.v1._shared import IdRequest
 from ai_platform.domain.models import Conversation, Message
 from ai_platform.infra.database.connection import get_db
 
@@ -46,19 +47,36 @@ class MessageOut(BaseModel):
     created_at: str
 
 
+class ConversationListRequest(BaseModel):
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=20, ge=1, le=100)
+
+
+class ConversationMessagesRequest(BaseModel):
+    conversation_id: str
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+
+
+class ConversationMessagesExportRequest(BaseModel):
+    conversation_id: str
+    format: str = Field(default="csv", pattern="^(csv|json)$", description="导出格式: csv 或 json")
+
+
 # =============================================================================
 # Endpoints
 # =============================================================================
 
 
-@router.get("/", response_model=ApiResponse[PaginatedResponse[ConversationOut]], dependencies=[Depends(require_permission("audit.view"))])
+@router.post("/list", response_model=ApiResponse[PaginatedResponse[ConversationOut]], dependencies=[Depends(require_permission("audit.view"))])
 async def list_conversations(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
+    req: ConversationListRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """List conversations for the current tenant/app."""
+    page = req.page
+    page_size = req.page_size
     offset = (page - 1) * page_size
 
     query = (
@@ -103,40 +121,14 @@ async def list_conversations(
     )
 
 
-@router.get("/{conversation_id}", response_model=ApiResponse[ConversationOut], dependencies=[Depends(require_permission("audit.view"))])
-async def get_conversation(
-    conversation_id: uuid.UUID,
-    ctx: RequestContext = Depends(get_request_context),
-    session: AsyncSession = Depends(get_db),
-):
-    """Get a conversation by ID."""
-    conv = await session.get(Conversation, conversation_id)
-    if not conv or conv.tenant_id != ctx.tenant_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-
-    return ApiResponse(
-        data=ConversationOut(
-            id=conv.id,
-            title=conv.title,
-            model=conv.model,
-            user_id=conv.user_id,
-            message_count=conv.message_count,
-            total_tokens=conv.total_tokens,
-            status=conv.status,
-            created_at=conv.created_at.isoformat(),
-        )
-    )
-
-
-@router.get("/{conversation_id}/messages", response_model=ApiResponse[list[MessageOut]], dependencies=[Depends(require_permission("audit.view"))])
+@router.post("/messages/list", response_model=ApiResponse[list[MessageOut]], dependencies=[Depends(require_permission("audit.view"))])
 async def get_messages(
-    conversation_id: uuid.UUID,
-    limit: int = Query(default=50, ge=1, le=200),
-    offset: int = Query(default=0, ge=0),
+    req: ConversationMessagesRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Get messages for a conversation."""
+    conversation_id = uuid.UUID(req.conversation_id)
     conv = await session.get(Conversation, conversation_id)
     if not conv or conv.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
@@ -145,8 +137,8 @@ async def get_messages(
         select(Message)
         .where(Message.conversation_id == conversation_id)
         .order_by(Message.created_at)
-        .offset(offset)
-        .limit(limit)
+        .offset(req.offset)
+        .limit(req.limit)
     )
     result = await session.execute(stmt)
     messages = result.scalars().all()
@@ -168,8 +160,8 @@ async def get_messages(
     return ApiResponse(data=items)
 
 
-@router.get(
-    "/{conversation_id}/messages/export",
+@router.post(
+    "/messages/export",
     summary="导出会话消息",
     description="将指定会话的所有消息导出为 CSV 或 JSON 文件。支持大数据量流式下载。",
     dependencies=[Depends(require_permission("audit.view"))],
@@ -179,12 +171,12 @@ async def get_messages(
     },
 )
 async def export_messages(
-    conversation_id: uuid.UUID,
-    format: str = Query(default="csv", pattern="^(csv|json)$", description="导出格式: csv 或 json"),
+    req: ConversationMessagesExportRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Export all messages of a conversation as CSV/JSON (streaming)."""
+    conversation_id = uuid.UUID(req.conversation_id)
     conv = await session.get(Conversation, conversation_id)
     if not conv or conv.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
@@ -215,6 +207,7 @@ async def export_messages(
     safe_title = (conv.title or f"conversation-{conversation_id}")[:60]
     safe_title = safe_title.replace('"', '_').replace(',', '_')
 
+    format = req.format
     if format == "json":
         from ai_platform.api.export_utils import make_json_stream
         return make_json_stream(
@@ -233,13 +226,40 @@ async def export_messages(
     )
 
 
-@router.delete("/{conversation_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("audit.view"))])
+@router.post("/get", response_model=ApiResponse[ConversationOut], dependencies=[Depends(require_permission("audit.view"))])
+async def get_conversation(
+    req: IdRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_db),
+):
+    """Get a conversation by ID."""
+    conversation_id = uuid.UUID(req.id)
+    conv = await session.get(Conversation, conversation_id)
+    if not conv or conv.tenant_id != ctx.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+
+    return ApiResponse(
+        data=ConversationOut(
+            id=conv.id,
+            title=conv.title,
+            model=conv.model,
+            user_id=conv.user_id,
+            message_count=conv.message_count,
+            total_tokens=conv.total_tokens,
+            status=conv.status,
+            created_at=conv.created_at.isoformat(),
+        )
+    )
+
+
+@router.post("/delete", response_model=ApiResponse, dependencies=[Depends(require_permission("audit.view"))])
 async def delete_conversation(
-    conversation_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Delete a conversation and its messages."""
+    conversation_id = uuid.UUID(req.id)
     conv = await session.get(Conversation, conversation_id)
     if not conv or conv.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")

@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 import structlog
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +18,7 @@ from ai_platform.api.middleware.auth import RequestContext, get_request_context
 from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.chat import ChatCompletionRequest, ChatMessage
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
+from ai_platform.api.v1._shared import IdRequest
 from ai_platform.config import get_settings
 from ai_platform.core.knowledge.chunkers.recursive import RecursiveChunker
 from ai_platform.core.knowledge.engine import KnowledgeEngine
@@ -83,12 +84,36 @@ class DocOut(BaseModel):
     created_at: str
 
 
-class KBQueryRequest(BaseModel):
+class KBListRequest(BaseModel):
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=20, ge=1, le=100)
+    group_id: str | None = Field(default=None, description="按分组过滤")
+
+
+class KBUpdateBody(BaseModel):
+    id: str
+    name: str | None = Field(default=None, max_length=128, min_length=1)
+    description: str | None = Field(default=None, max_length=1000)
+    embedding_model: str | None = Field(default=None, max_length=100)
+    group_id: str | None = Field(default=None, description="知识库分组 ID")
+
+
+class KBQueryBody(BaseModel):
+    kb_id: str
     question: str = Field(max_length=10000, min_length=1)
     top_k: int = Field(default=5, ge=1, le=20)
     score_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
     generate_answer: bool = Field(default=True, description="Use LLM to generate answer from chunks")
     model: str = Field(default="gpt-4o", max_length=100)
+
+
+class KBDocIdRequest(BaseModel):
+    kb_id: str
+    id: str
+
+
+class KBDocListRequest(BaseModel):
+    kb_id: str
 
 
 class RetrievedChunkOut(BaseModel):
@@ -266,7 +291,7 @@ async def _process_document(
 # =============================================================================
 
 
-@router.post("/", response_model=ApiResponse[KBOut], dependencies=[Depends(require_permission("knowledge.write"))])
+@router.post("/create", response_model=ApiResponse[KBOut], dependencies=[Depends(require_permission("knowledge.write"))])
 async def create_knowledge_base(
     req: KBCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -305,15 +330,16 @@ async def create_knowledge_base(
     ))
 
 
-@router.get("/", response_model=ApiResponse[PaginatedResponse[KBOut]], dependencies=[Depends(require_permission("knowledge.read"))])
+@router.post("/list", response_model=ApiResponse[PaginatedResponse[KBOut]], dependencies=[Depends(require_permission("knowledge.read"))])
 async def list_knowledge_bases(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    group_id: str | None = Query(default=None, description="按分组过滤"),
+    req: KBListRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """List knowledge bases for the current tenant."""
+    page = req.page
+    page_size = req.page_size
+    group_id = req.group_id
     offset = (page - 1) * page_size
 
     conditions = [KnowledgeBase.tenant_id == ctx.tenant_id]
@@ -345,13 +371,14 @@ async def list_knowledge_bases(
     return ApiResponse(data=PaginatedResponse(items=items, total=total, page=page, page_size=page_size))
 
 
-@router.get("/{kb_id}", response_model=ApiResponse[KBOut], dependencies=[Depends(require_permission("knowledge.read"))])
+@router.post("/get", response_model=ApiResponse[KBOut], dependencies=[Depends(require_permission("knowledge.read"))])
 async def get_knowledge_base(
-    kb_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Get knowledge base details."""
+    kb_id = uuid.UUID(req.id)
     kb = await session.get(KnowledgeBase, kb_id)
     if not kb or kb.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
@@ -364,26 +391,19 @@ async def get_knowledge_base(
     ))
 
 
-class KBUpdateRequest(BaseModel):
-    name: str | None = Field(default=None, max_length=128, min_length=1)
-    description: str | None = Field(default=None, max_length=1000)
-    embedding_model: str | None = Field(default=None, max_length=100)
-    group_id: str | None = Field(default=None, description="知识库分组 ID")
-
-
-@router.put("/{kb_id}", response_model=ApiResponse[KBOut], dependencies=[Depends(require_permission("knowledge.write"))])
+@router.post("/update", response_model=ApiResponse[KBOut], dependencies=[Depends(require_permission("knowledge.write"))])
 async def update_knowledge_base(
-    kb_id: uuid.UUID,
-    body: KBUpdateRequest,
+    body: KBUpdateBody,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Update knowledge base metadata."""
+    kb_id = uuid.UUID(body.id)
     kb = await session.get(KnowledgeBase, kb_id)
     if not kb or kb.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
 
-    updates = body.model_dump(exclude_unset=True)
+    updates = body.model_dump(exclude_unset=True, exclude={"id"})
     if "group_id" in updates and updates["group_id"] is not None:
         updates["group_id"] = uuid.UUID(updates["group_id"])
 
@@ -401,13 +421,14 @@ async def update_knowledge_base(
     ))
 
 
-@router.delete("/{kb_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("knowledge.write"))])
+@router.post("/delete", response_model=ApiResponse, dependencies=[Depends(require_permission("knowledge.write"))])
 async def delete_knowledge_base(
-    kb_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Delete a knowledge base and all its documents/chunks."""
+    kb_id = uuid.UUID(req.id)
     kb = await session.get(KnowledgeBase, kb_id)
     if not kb or kb.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
@@ -434,15 +455,16 @@ async def delete_knowledge_base(
 # =============================================================================
 
 
-@router.post("/{kb_id}/documents", response_model=ApiResponse[DocOut], dependencies=[Depends(require_permission("knowledge.write"))])
+@router.post("/documents/upload", response_model=ApiResponse[DocOut], dependencies=[Depends(require_permission("knowledge.write"))])
 async def upload_document(
-    kb_id: uuid.UUID,
     file: UploadFile = File(...),
+    kb_id: str = Form(..., description="Knowledge base ID"),
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Upload a document. Processing happens in the background."""
-    kb = await session.get(KnowledgeBase, kb_id)
+    kb_uuid = uuid.UUID(kb_id)
+    kb = await session.get(KnowledgeBase, kb_uuid)
     if not kb or kb.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
 
@@ -509,13 +531,14 @@ async def upload_document(
     return ApiResponse(data=_doc_to_out(doc))
 
 
-@router.get("/{kb_id}/documents", response_model=ApiResponse[list[DocOut]], dependencies=[Depends(require_permission("knowledge.read"))])
+@router.post("/documents/list", response_model=ApiResponse[list[DocOut]], dependencies=[Depends(require_permission("knowledge.read"))])
 async def list_documents(
-    kb_id: uuid.UUID,
+    req: KBDocListRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """List documents in a knowledge base."""
+    kb_id = uuid.UUID(req.kb_id)
     kb = await session.get(KnowledgeBase, kb_id)
     if not kb or kb.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
@@ -527,14 +550,15 @@ async def list_documents(
     return ApiResponse(data=[_doc_to_out(d) for d in docs])
 
 
-@router.get("/{kb_id}/documents/{doc_id}", response_model=ApiResponse[DocOut], dependencies=[Depends(require_permission("knowledge.read"))])
+@router.post("/documents/get", response_model=ApiResponse[DocOut], dependencies=[Depends(require_permission("knowledge.read"))])
 async def get_document(
-    kb_id: uuid.UUID,
-    doc_id: uuid.UUID,
+    req: KBDocIdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Get document details including processing progress."""
+    kb_id = uuid.UUID(req.kb_id)
+    doc_id = uuid.UUID(req.id)
     kb = await session.get(KnowledgeBase, kb_id)
     if not kb or kb.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
@@ -546,14 +570,15 @@ async def get_document(
     return ApiResponse(data=_doc_to_out(doc))
 
 
-@router.post("/{kb_id}/documents/{doc_id}/retry", response_model=ApiResponse[DocOut], dependencies=[Depends(require_permission("knowledge.write"))])
+@router.post("/documents/retry", response_model=ApiResponse[DocOut], dependencies=[Depends(require_permission("knowledge.write"))])
 async def retry_document(
-    kb_id: uuid.UUID,
-    doc_id: uuid.UUID,
+    req: KBDocIdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Retry processing a failed document."""
+    kb_id = uuid.UUID(req.kb_id)
+    doc_id = uuid.UUID(req.id)
     kb = await session.get(KnowledgeBase, kb_id)
     if not kb or kb.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
@@ -625,14 +650,15 @@ async def retry_document(
     return ApiResponse(data=_doc_to_out(doc))
 
 
-@router.delete("/{kb_id}/documents/{doc_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("knowledge.write"))])
+@router.post("/documents/delete", response_model=ApiResponse, dependencies=[Depends(require_permission("knowledge.write"))])
 async def delete_document(
-    kb_id: uuid.UUID,
-    doc_id: uuid.UUID,
+    req: KBDocIdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Delete a document, its chunks, and its vectors."""
+    kb_id = uuid.UUID(req.kb_id)
+    doc_id = uuid.UUID(req.id)
     kb = await session.get(KnowledgeBase, kb_id)
     if not kb or kb.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
@@ -684,16 +710,16 @@ async def delete_document(
 # =============================================================================
 
 
-@router.post("/{kb_id}/query", response_model=ApiResponse, dependencies=[Depends(require_permission("knowledge.read"))])
+@router.post("/query", response_model=ApiResponse, dependencies=[Depends(require_permission("knowledge.read"))])
 async def query_knowledge_base(
-    kb_id: uuid.UUID,
-    req: KBQueryRequest,
+    req: KBQueryBody,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """
     Query a knowledge base — retrieve relevant chunks and optionally generate an answer.
     """
+    kb_id = uuid.UUID(req.kb_id)
     kb = await session.get(KnowledgeBase, kb_id)
     if not kb or kb.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=404, detail="Knowledge base not found")
