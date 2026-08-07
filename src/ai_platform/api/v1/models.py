@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import uuid
+from uuid import UUID
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
 from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse
+from ai_platform.api.v1._shared import IdRequest
 from ai_platform.infra.database.connection import get_db
 from ai_platform.services.model_resolver import (
     ModelResolverService,
@@ -104,10 +105,18 @@ class ProviderCreateRequest(BaseModel):
 
 
 class ProviderUpdateKeyRequest(BaseModel):
+    id: str = Field(description="Provider ID")
     api_key: str = Field(description="New API key — will be encrypted before storage")
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, v: str) -> str:
+        UUID(v)  # raises ValueError if invalid
+        return v
 
 
 class ProviderUpdateRequest(BaseModel):
+    id: str = Field(description="Provider ID")
     display_name: str | None = Field(default=None, description="Human-readable name")
     api_base_url: str | None = Field(
         default=None, description="Custom API base URL (for private deployments)"
@@ -126,6 +135,51 @@ class ProviderUpdateRequest(BaseModel):
         ),
     )
     priority: int | None = Field(default=None, description="Higher = preferred in routing")
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, v: str) -> str:
+        UUID(v)  # raises ValueError if invalid
+        return v
+
+
+class ProviderToggleRequest(BaseModel):
+    """Body for provider enable/disable endpoint."""
+
+    id: str = Field(description="Provider ID")
+    enabled: bool = Field(description="True to enable the provider, False to disable.")
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, v: str) -> str:
+        UUID(v)  # raises ValueError if invalid
+        return v
+
+
+class ModelToggleRequest(BaseModel):
+    """B-07: typed body for per-model enable/disable endpoint."""
+
+    provider_id: str = Field(description="Provider ID")
+    model_name: str = Field(description="Model identifier, e.g. 'gpt-4o'")
+    enabled: bool = Field(description="True to enable the model, False to disable.")
+
+    @field_validator("provider_id")
+    @classmethod
+    def validate_provider_id(cls, v: str) -> str:
+        UUID(v)  # raises ValueError if invalid
+        return v
+
+
+class AvailableListRequest(BaseModel):
+    """Body for listing available models with optional purpose filter."""
+
+    purpose: str | None = Field(default=None, description="Filter by purpose (llm, vision, embedding, etc.)")
+
+
+class PurposeRequest(BaseModel):
+    """Body for endpoints that require a model purpose."""
+
+    purpose: str = Field(description="Model purpose: llm, vision, embedding, etc.")
 
 
 class ProviderOut(BaseModel):
@@ -160,18 +214,12 @@ class ProviderTestResultOut(BaseModel):
     message: str
 
 
-class ModelToggleRequest(BaseModel):
-    """B-07: typed body for per-model enable/disable endpoint."""
-
-    enabled: bool = Field(description="True to enable the model, False to disable.")
-
-
 # =============================================================================
 # Provider CRUD — 密钥通过后台管理，加密存储
 # =============================================================================
 
 
-@router.post("/providers", response_model=ApiResponse[ProviderOut], dependencies=[Depends(require_permission("model.manage"))])
+@router.post("/providers/create", response_model=ApiResponse[ProviderOut], dependencies=[Depends(require_permission("model.manage"))])
 async def create_provider(
     req: ProviderCreateRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -203,7 +251,7 @@ async def create_provider(
     return ApiResponse(data=ProviderOut(**provider_data))
 
 
-@router.get("/providers", response_model=ApiResponse[list[ProviderOut]], dependencies=[Depends(require_permission("model.read"))])
+@router.post("/providers/list", response_model=ApiResponse[list[ProviderOut]], dependencies=[Depends(require_permission("model.read"))])
 async def list_providers(
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
@@ -214,9 +262,8 @@ async def list_providers(
     return ApiResponse(data=[ProviderOut(**p) for p in providers])
 
 
-@router.put("/providers/{provider_id}/key", response_model=ApiResponse, dependencies=[Depends(require_permission("model.manage"))])
+@router.post("/providers/update-key", response_model=ApiResponse, dependencies=[Depends(require_permission("model.manage"))])
 async def update_provider_key(
-    provider_id: uuid.UUID,
     req: ProviderUpdateKeyRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
@@ -224,15 +271,14 @@ async def update_provider_key(
     """更新提供商的 API Key（重新加密存储）。"""
     svc = ProviderService(session)
     try:
-        await svc.update_api_key(provider_id, req.api_key)
+        await svc.update_api_key(UUID(req.id), req.api_key)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return ApiResponse(message="API key updated (encrypted)")
 
 
-@router.put("/providers/{provider_id}", response_model=ApiResponse[ProviderOut], dependencies=[Depends(require_permission("model.manage"))])
+@router.post("/providers/update", response_model=ApiResponse[ProviderOut], dependencies=[Depends(require_permission("model.manage"))])
 async def update_provider(
-    provider_id: uuid.UUID,
     req: ProviderUpdateRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
@@ -244,6 +290,7 @@ async def update_provider(
     先执行连通性测试再重新启用。
     """
     svc = ProviderService(session)
+    provider_id = UUID(req.id)
     try:
         _provider, needs_retest = await svc.update_provider(
             provider_id,
@@ -269,12 +316,12 @@ async def update_provider(
 
 
 @router.post(
-    "/providers/{provider_id}/test",
+    "/providers/test",
     response_model=ApiResponse[ProviderTestResultOut],
     dependencies=[Depends(require_permission("model.manage"))],
 )
 async def test_provider(
-    provider_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
@@ -287,43 +334,42 @@ async def test_provider(
     """
     svc = ProviderService(session)
     try:
-        result = await svc.test_provider(provider_id)
+        result = await svc.test_provider(UUID(req.id))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
     return ApiResponse(data=ProviderTestResultOut(**result))
 
 
-@router.put("/providers/{provider_id}/toggle", response_model=ApiResponse, dependencies=[Depends(require_permission("model.manage"))])
+@router.post("/providers/toggle", response_model=ApiResponse, dependencies=[Depends(require_permission("model.manage"))])
 async def toggle_provider(
-    provider_id: uuid.UUID,
-    enabled: bool,
+    req: ProviderToggleRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """启用/禁用提供商。"""
     svc = ProviderService(session)
     try:
-        await svc.toggle_provider(provider_id, enabled)
+        await svc.toggle_provider(UUID(req.id), req.enabled)
     except ValueError as e:
         err_msg = str(e)
         # B-05: re-test requirement surfaces as 400 (not 404)
         if "needs connectivity test" in err_msg:
             raise HTTPException(status_code=400, detail=err_msg)
         raise HTTPException(status_code=404, detail=err_msg)
-    return ApiResponse(message=f"Provider {'enabled' if enabled else 'disabled'}")
+    return ApiResponse(message=f"Provider {'enabled' if req.enabled else 'disabled'}")
 
 
-@router.delete("/providers/{provider_id}", response_model=ApiResponse, dependencies=[Depends(require_permission("model.manage"))])
+@router.post("/providers/delete", response_model=ApiResponse, dependencies=[Depends(require_permission("model.manage"))])
 async def delete_provider(
-    provider_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """删除提供商及其加密密钥。"""
     svc = ProviderService(session)
     try:
-        await svc.delete_provider(provider_id)
+        await svc.delete_provider(UUID(req.id))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return ApiResponse(message="Provider and encrypted key deleted")
@@ -334,7 +380,7 @@ async def delete_provider(
 # =============================================================================
 
 
-@router.get("/", response_model=ApiResponse[list[dict]], dependencies=[Depends(require_permission("model.read"))])
+@router.post("/list", response_model=ApiResponse[list[dict]], dependencies=[Depends(require_permission("model.read"))])
 async def list_models(
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
@@ -366,9 +412,9 @@ async def list_models(
     return ApiResponse(data=all_models)
 
 
-@router.get("/available", response_model=ApiResponse[list[dict]], dependencies=[Depends(require_permission("model.read"))])
+@router.post("/available/list", response_model=ApiResponse[list[dict]], dependencies=[Depends(require_permission("model.read"))])
 async def list_available_models(
-    purpose: str | None = None,
+    req: AvailableListRequest = AvailableListRequest(),
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
@@ -376,7 +422,7 @@ async def list_available_models(
     from ai_platform.services.model_resolver import ModelResolverService
 
     resolver = ModelResolverService(session)
-    items = await resolver.list_available(ctx.tenant_id, purpose=purpose)
+    items = await resolver.list_available(ctx.tenant_id, purpose=req.purpose)
     return ApiResponse(
         data=[
             {
@@ -409,33 +455,33 @@ class DefaultConfigOut(BaseModel):
     source: str = Field(description="'db' or 'env'")
 
 
-@router.get(
-    "/default-config/{purpose}",
+@router.post(
+    "/default-config/get",
     response_model=ApiResponse[DefaultConfigOut],
     dependencies=[Depends(require_permission("model.read"))],
 )
 async def get_default_config(
-    purpose: str,
+    req: PurposeRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """返回指定用途下优先级最高的模型配置（不含密钥，普通用户可用）。"""
-    if purpose not in VALID_PURPOSES:
+    if req.purpose not in VALID_PURPOSES:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid purpose '{purpose}'. Valid values: {sorted(VALID_PURPOSES)}",
+            detail=f"Invalid purpose '{req.purpose}'. Valid values: {sorted(VALID_PURPOSES)}",
         )
 
     resolver = ModelResolverService(session)
-    config = await resolver.get_default_for_purpose(ctx.tenant_id, purpose)
+    config = await resolver.get_default_for_purpose(ctx.tenant_id, req.purpose)
 
     if config is None:
         # Try env fallback
-        config = resolver.get_env_fallback(purpose)
+        config = resolver.get_env_fallback(req.purpose)
         if config is None:
             raise HTTPException(
                 status_code=404,
-                detail=f"No model configured for purpose '{purpose}'",
+                detail=f"No model configured for purpose '{req.purpose}'",
             )
         return ApiResponse(
             data=DefaultConfigOut(
@@ -473,13 +519,13 @@ class DefaultInternalOut(BaseModel):
     source: str
 
 
-@router.get(
-    "/default/{purpose}",
+@router.post(
+    "/default/get",
     response_model=ApiResponse[DefaultInternalOut],
     dependencies=[Depends(require_permission("model.manage"))],
 )
 async def get_default_internal(
-    purpose: str,
+    req: PurposeRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
@@ -488,21 +534,21 @@ async def get_default_internal(
     ⚠️  仅限内部服务或管理员调用 — 响应中包含明文 API Key。
     需要 ``model.manage`` 权限（或 super-admin / ``*`` 超级权限）。
     """
-    if purpose not in VALID_PURPOSES:
+    if req.purpose not in VALID_PURPOSES:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid purpose '{purpose}'. Valid values: {sorted(VALID_PURPOSES)}",
+            detail=f"Invalid purpose '{req.purpose}'. Valid values: {sorted(VALID_PURPOSES)}",
         )
 
     resolver = ModelResolverService(session)
-    config = await resolver.get_default_for_purpose(ctx.tenant_id, purpose)
+    config = await resolver.get_default_for_purpose(ctx.tenant_id, req.purpose)
 
     if config is None:
-        config = resolver.get_env_fallback(purpose)
+        config = resolver.get_env_fallback(req.purpose)
         if config is None:
             raise HTTPException(
                 status_code=404,
-                detail=f"No model configured for purpose '{purpose}'",
+                detail=f"No model configured for purpose '{req.purpose}'",
             )
         return ApiResponse(
             data=DefaultInternalOut(
@@ -537,13 +583,11 @@ async def get_default_internal(
 
 
 @router.post(
-    "/providers/{provider_id}/models/{model_name}/toggle",
+    "/providers/models/toggle",
     response_model=ApiResponse,
     dependencies=[Depends(require_permission("model.manage"))],
 )
 async def toggle_model_enabled(
-    provider_id: uuid.UUID,
-    model_name: str,
     req: ModelToggleRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
@@ -552,11 +596,11 @@ async def toggle_model_enabled(
     resolver = ModelResolverService(session)
     try:
         new_enabled = await resolver.set_model_enabled(
-            ctx.tenant_id, provider_id, model_name, req.enabled
+            ctx.tenant_id, UUID(req.provider_id), req.model_name, req.enabled
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
     return ApiResponse(
-        message=f"Model '{model_name}' {'enabled' if new_enabled else 'disabled'}"
+        message=f"Model '{req.model_name}' {'enabled' if new_enabled else 'disabled'}"
     )

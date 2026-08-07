@@ -15,13 +15,14 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_platform.api.middleware.auth import RequestContext, get_request_context
 from ai_platform.api.middleware.permissions import require_permission
 from ai_platform.api.schemas.common import ApiResponse, PaginatedResponse
+from ai_platform.api.v1._shared import IdRequest
 from ai_platform.domain.models import SsoProvider
 from ai_platform.infra.database.connection import get_db
 
@@ -51,6 +52,7 @@ class SsoProviderCreateRequest(BaseModel):
 
 
 class SsoProviderUpdateRequest(BaseModel):
+    id: str = Field(description="SSO Provider ID")
     display_name: str | None = None
     client_id: str | None = None
     client_secret: str | None = None
@@ -59,6 +61,12 @@ class SsoProviderUpdateRequest(BaseModel):
     scopes: list[str] | None = None
     extra_config: dict | None = None
     is_enabled: bool | None = None
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, v: str) -> str:
+        uuid.UUID(v)  # raises ValueError if invalid
+        return v
 
 
 class SsoProviderOut(BaseModel):
@@ -121,8 +129,8 @@ def _to_out(provider: SsoProvider) -> SsoProviderOut:
 # =============================================================================
 
 
-@router.get(
-    "/providers",
+@router.post(
+    "/providers/list",
     response_model=ApiResponse[list[SsoProviderOut]],
     summary="获取 SSO 提供者列表",
     description="返回当前租户所有已配置的 SSO 身份提供者。client_secret 不会被返回。",
@@ -144,7 +152,7 @@ async def list_sso_providers(
 
 
 @router.post(
-    "/providers",
+    "/providers/create",
     response_model=ApiResponse[SsoProviderOut],
     summary="创建 SSO 提供者",
     description="注册一个新的 SSO 身份提供者。client_secret 会加密存储。",
@@ -194,21 +202,20 @@ async def create_sso_provider(
     return ApiResponse(data=_to_out(provider))
 
 
-@router.put(
-    "/providers/{provider_id}",
+@router.post(
+    "/providers/update",
     response_model=ApiResponse[SsoProviderOut],
     summary="更新 SSO 提供者",
     dependencies=[Depends(require_permission("system.config"))],
 )
 async def update_sso_provider(
-    provider_id: uuid.UUID,
     req: SsoProviderUpdateRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Update an SSO provider."""
     stmt = select(SsoProvider).where(
-        SsoProvider.id == provider_id,
+        SsoProvider.id == uuid.UUID(req.id),
         SsoProvider.tenant_id == ctx.tenant_id,
     )
     result = await session.execute(stmt)
@@ -238,20 +245,20 @@ async def update_sso_provider(
     return ApiResponse(data=_to_out(provider))
 
 
-@router.delete(
-    "/providers/{provider_id}",
+@router.post(
+    "/providers/delete",
     response_model=ApiResponse,
     summary="删除 SSO 提供者",
     dependencies=[Depends(require_permission("system.config"))],
 )
 async def delete_sso_provider(
-    provider_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Delete an SSO provider."""
     stmt = select(SsoProvider).where(
-        SsoProvider.id == provider_id,
+        SsoProvider.id == uuid.UUID(req.id),
         SsoProvider.tenant_id == ctx.tenant_id,
     )
     result = await session.execute(stmt)
@@ -263,8 +270,8 @@ async def delete_sso_provider(
     return ApiResponse(message="SSO 提供者已删除")
 
 
-@router.get(
-    "/providers/{provider_id}/authorize",
+@router.post(
+    "/providers/authorize",
     response_model=ApiResponse[SsoAuthorizeOut],
     summary="发起 SSO 授权",
     description="生成第三方身份提供者的授权 URL。前端重定向用户至此 URL 完成登录。",
@@ -275,13 +282,13 @@ async def delete_sso_provider(
     },
 )
 async def initiate_sso_authorize(
-    provider_id: uuid.UUID,
+    req: IdRequest,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_db),
 ):
     """Initiate SSO authorization — returns the IdP redirect URL."""
     stmt = select(SsoProvider).where(
-        SsoProvider.id == provider_id,
+        SsoProvider.id == uuid.UUID(req.id),
         SsoProvider.tenant_id == ctx.tenant_id,
     )
     result = await session.execute(stmt)
@@ -375,6 +382,11 @@ async def initiate_sso_authorize(
     raise HTTPException(status_code=400, detail=f"不支持的提供者类型: {provider.provider_type}")
 
 
+# NOTE: This endpoint MUST remain GET — it is the OAuth2/OIDC callback URL that
+# the identity provider redirects the user's browser to after authorization.
+# The IdP controls the HTTP method (always GET with query parameters for code
+# and state). This is the only route in the SSO module exempt from the POST-only
+# migration policy.
 @router.get(
     "/callback/{provider_name}",
     summary="SSO 回调",
