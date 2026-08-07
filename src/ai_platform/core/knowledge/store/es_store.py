@@ -68,7 +68,6 @@ class ElasticsearchStore:
                                 "embedding": {
                                     "type": "dense_vector",
                                     "dims": dim,
-                                    "index": True,
                                     "similarity": "cosine",
                                 },
                             }
@@ -117,17 +116,19 @@ class ElasticsearchStore:
                 index=self._index_name,
                 body={
                     "query": {
-                        "multi_match": {
-                            "query": query_text,
-                            "fields": ["content"],
-                            "type": "best_fields",
+                        "script_score": {
+                            "query": {
+                                "multi_match": {
+                                    "query": query_text,
+                                    "fields": ["content"],
+                                    "type": "best_fields",
+                                }
+                            },
+                            "script": {
+                                "source": "cosineSimilarity(params.query_vector, 'embedding') + 1.0",
+                                "params": {"query_vector": query_embedding},
+                            },
                         }
-                    },
-                    "knn": {
-                        "field": "embedding",
-                        "query_vector": query_embedding,
-                        "k": top_k,
-                        "num_candidates": top_k * 10,
                     },
                     "size": top_k,
                 },
