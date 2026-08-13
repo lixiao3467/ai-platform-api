@@ -824,3 +824,98 @@ async def query_knowledge_base(
         "sources": retrieved,
         "chunks_count": len(chunks),
     })
+
+
+# =============================================================================
+# ES Diagnostic endpoint
+# =============================================================================
+
+
+@router.post("/es-diagnose")
+async def diagnose_es(
+    ctx: RequestContext = Depends(get_request_context),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse:
+    """
+    Diagnose Elasticsearch connection and data status.
+
+    Returns:
+    - Configured ES URL (masked)
+    - Whether the ES package is installed
+    - Whether the client can connect
+    - List of all KBs and their ES index status
+    - Test write result
+    """
+    from urllib.parse import urlparse
+
+    result: dict = {}
+
+    # 1. Check env var
+    settings = get_settings()
+    raw_url = settings.elasticsearch_url or ""
+    parsed = urlparse(raw_url) if raw_url else None
+    result["env"] = {
+        "raw_url_masked": (
+            f"https://{parsed.username}:***@{parsed.hostname}"
+            if parsed else raw_url or "(empty)"
+        ),
+        "hostname": parsed.hostname if parsed else None,
+        "port": parsed.port if parsed else None,
+        "is_default": raw_url == "http://localhost:9200",
+        "is_empty": not raw_url,
+    }
+
+    # 2. Check package installed
+    try:
+        import elasticsearch as es_pkg
+        result["package"] = {"installed": True, "version": getattr(es_pkg, "__version__", "unknown")}
+    except ImportError:
+        result["package"] = {"installed": False, "version": None}
+        return ApiResponse(data=result)
+
+    # 3. Try to create client and list indices
+    client = None
+    try:
+        from elasticsearch import AsyncElasticsearch
+        if parsed:
+            host = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 443}"
+            auth = (parsed.username, parsed.password) if parsed.username else None
+            client = AsyncElasticsearch(hosts=[host], basic_auth=auth, verify_certs=False)
+            info = await client.info()
+            result["cluster"] = {
+                "connected": True,
+                "cluster_name": info.get("cluster_name"),
+                "version": info.get("version", {}).get("number"),
+            }
+            # List all indices
+            indices_resp = await client.cat.indices(format="json", h="index,docs.count,store.size")
+            result["indices"] = indices_resp.body if hasattr(indices_resp, "body") else indices_resp
+            # Count KBs
+            kb_count = await db.scalar(select(func.count()).select_from(KnowledgeBase))
+            result["kb_count"] = kb_count or 0
+
+            # Test write: index a small doc
+            test_index = "_es_diagnose_test"
+            try:
+                await client.index(index=test_index, id="test_1", document={"test": True, "ts": "now"})
+                await client.indices.refresh(index=test_index)
+                search_resp = await client.search(index=test_index, query={"match_all": {}})
+                hits = search_resp.get("hits", {}).get("hits", [])
+                result["test_write"] = {"success": True, "hits_returned": len(hits)}
+            except Exception as e:
+                result["test_write"] = {"success": False, "error": type(e).__name__, "detail": str(e)[:300]}
+            finally:
+                try:
+                    await client.indices.delete(index=test_index, ignore_status=[404])
+                except Exception:
+                    pass
+
+        else:
+            result["cluster"] = {"connected": False, "error": "no ES URL configured"}
+    except Exception as e:
+        result["cluster"] = {"connected": False, "error": type(e).__name__, "detail": str(e)[:300]}
+    finally:
+        if client:
+            await client.close()
+
+    return ApiResponse(data=result)
