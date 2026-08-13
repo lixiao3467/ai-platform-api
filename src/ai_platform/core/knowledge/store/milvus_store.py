@@ -47,6 +47,28 @@ class MilvusStore:
             self._client = await asyncio.to_thread(_connect)
             # Ensure collection exists
             has = await asyncio.to_thread(self._client.has_collection, self._collection_name)
+            if has and self._dim:
+                # If the caller supplied an explicit dimension, verify the
+                # existing collection matches.  If not, drop and recreate so
+                # we don't get a dimension-mismatch error on insert.
+                desc = await asyncio.to_thread(self._client.describe_collection, self._collection_name)
+                for field in desc.get("fields", []):
+                    if field.get("field_name") == "embedding":
+                        existing_dim = None
+                        for p in field.get("params", []):
+                            if p.get("key") == "dim":
+                                existing_dim = int(p["value"])
+                                break
+                        if existing_dim and existing_dim != self._dim:
+                            await asyncio.to_thread(self._client.drop_collection, self._collection_name)
+                            has = False
+                            logger.info(
+                                "Dropped stale Milvus collection due to dimension mismatch",
+                                name=self._collection_name,
+                                existing_dim=existing_dim,
+                                new_dim=self._dim,
+                            )
+                        break
             if not has:
                 await self._create_collection_async()
         return self._client
