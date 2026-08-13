@@ -1,6 +1,7 @@
-"""Elasticsearch hybrid search store for knowledge base chunks.
+"""Elasticsearch/OpenSearch hybrid search store for knowledge base chunks.
 
-Uses elasticsearch-py v8.x API — no deprecated `body=` parameter.
+Uses opensearch-py (Bonsai runs OpenSearch, not Elasticsearch).
+API is compatible with elasticsearch-py v7.x style.
 """
 
 from __future__ import annotations
@@ -15,10 +16,10 @@ _store_cache: dict[str, 'ElasticsearchStore'] = {}
 
 
 class ElasticsearchStore:
-    """Elasticsearch store providing BM25 text + KNN vector hybrid search.
+    """OpenSearch store providing BM25 text + KNN vector hybrid search.
 
     Complements Milvus for hybrid retrieval with RRF (Reciprocal Rank Fusion).
-    Requires elasticsearch-py >= 8.15 (uses keyword-arg API, not body=).
+    Uses opensearch-py — Bonsai runs OpenSearch 3.x, not Elasticsearch.
     """
 
     def __init__(self, index_name: str) -> None:
@@ -26,15 +27,15 @@ class ElasticsearchStore:
         self._client: object | None = None
         self._available = True
 
-    def _get_client(self):  # -> AsyncElasticsearch | None:
-        """Lazy-init AsyncElasticsearch client with graceful degradation."""
+    def _get_client(self):  # -> AsyncOpenSearch | None:
+        """Lazy-init AsyncOpenSearch client with graceful degradation."""
         if self._client is not None:
             return self._client
         try:
-            from elasticsearch import AsyncElasticsearch
+            from opensearchpy import AsyncOpenSearch
         except ImportError:
             self._available = False
-            logger.warning("elasticsearch package not installed, disabling ES")
+            logger.warning("opensearch-py package not installed, disabling ES")
             return None
 
         settings = get_settings()
@@ -48,22 +49,15 @@ class ElasticsearchStore:
 
         try:
             parsed = urlparse(es_url)
-            host = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 443}"
-
-            # ES 8.x: use basic_auth (tuple) instead of deprecated http_auth
+            host = f"{parsed.hostname}:{parsed.port or 443}"
             auth = (parsed.username, parsed.password) if parsed.username else None
-
-            # Bonsai (and many hosted ES providers) don't return the
-            # `X-Elastic-Product: Elasticsearch` header that elasticsearch-py
-            # v8/v9 requires on every 2XX response.  Pre-set the flag so the
-            # first request doesn't raise UnsupportedProductError.
-            self._client = AsyncElasticsearch(
-                hosts=[host],
-                basic_auth=auth,
+            self._client = AsyncOpenSearch(
+                hosts=[{"host": parsed.hostname, "port": parsed.port or 443}],
+                http_auth=auth,
+                use_ssl=(parsed.scheme == "https"),
                 verify_certs=False,
+                ssl_show_warn=False,
             )
-            self._client._verified_elasticsearch = True
-            logger.info("ES client created", host=parsed.hostname, port=parsed.port or 443)
             logger.info("ES client created", host=parsed.hostname, port=parsed.port or 443)
         except Exception as exc:
             self._available = False
@@ -83,22 +77,23 @@ class ElasticsearchStore:
         try:
             exists = await client.indices.exists(index=self._index_name)
             if not exists:
-                # ES 8.x: mappings/settings are top-level kwargs, not inside body
                 await client.indices.create(
                     index=self._index_name,
-                    mappings={
-                        "properties": {
-                            "content": {"type": "text", "analyzer": "standard"},
-                            "document_id": {"type": "keyword"},
-                            "kb_id": {"type": "keyword"},
-                            "chunk_id": {"type": "keyword"},
-                            "chunk_index": {"type": "integer"},
-                            "filename": {"type": "keyword"},
-                            "embedding": {
-                                "type": "dense_vector",
-                                "dims": dim,
-                                "similarity": "cosine",
-                            },
+                    body={
+                        "mappings": {
+                            "properties": {
+                                "content": {"type": "text", "analyzer": "standard"},
+                                "document_id": {"type": "keyword"},
+                                "kb_id": {"type": "keyword"},
+                                "chunk_id": {"type": "keyword"},
+                                "chunk_index": {"type": "integer"},
+                                "filename": {"type": "keyword"},
+                                "embedding": {
+                                    "type": "dense_vector",
+                                    "dims": dim,
+                                    "similarity": "cosine",
+                                },
+                            }
                         }
                     },
                 )
@@ -126,11 +121,10 @@ class ElasticsearchStore:
             logger.warning("ES index_chunk skipped: no client", chunk_id=chunk_id)
             return
         try:
-            # ES 8.x: use document= instead of body=
             await client.index(
                 index=self._index_name,
                 id=chunk_id,
-                document={
+                body={
                     "content": content,
                     "embedding": embedding,
                     "chunk_id": chunk_id,
@@ -138,7 +132,6 @@ class ElasticsearchStore:
                 },
             )
         except Exception as e:
-            # Log at ERROR level so it's visible, not silently swallowed
             logger.error(
                 "ES index_chunk FAILED",
                 chunk_id=chunk_id,
@@ -156,17 +149,18 @@ class ElasticsearchStore:
         if not client:
             return []
         try:
-            # ES 8.x: query= is a top-level kwarg
             resp = await client.search(
                 index=self._index_name,
-                query={
-                    "multi_match": {
-                        "query": query_text,
-                        "fields": ["content"],
-                        "type": "best_fields",
-                    }
+                body={
+                    "query": {
+                        "multi_match": {
+                            "query": query_text,
+                            "fields": ["content"],
+                            "type": "best_fields",
+                        }
+                    },
+                    "size": top_k,
                 },
-                size=top_k,
             )
             hits = resp.get("hits", {}).get("hits", [])
             return [
@@ -181,7 +175,7 @@ class ElasticsearchStore:
         if not client:
             return
         try:
-            await client.indices.delete(index=self._index_name, ignore_status=[404])
+            await client.indices.delete(index=self._index_name, ignore=[404])
         except Exception as e:
             logger.warning("ES delete_index failed", error=str(e))
 
@@ -190,10 +184,9 @@ class ElasticsearchStore:
         if not client:
             return
         try:
-            # ES 8.x: query= is a top-level kwarg
             await client.delete_by_query(
                 index=self._index_name,
-                query={"term": {"document_id": doc_id}},
+                body={"query": {"term": {"document_id": doc_id}}},
             )
         except Exception as e:
             logger.warning("ES delete_by_document_id failed", error=str(e))

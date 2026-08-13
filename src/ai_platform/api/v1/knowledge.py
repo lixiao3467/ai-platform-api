@@ -867,8 +867,8 @@ async def diagnose_es(
 
     # 2. Check package installed
     try:
-        import elasticsearch as es_pkg
-        result["package"] = {"installed": True, "version": getattr(es_pkg, "__version__", "unknown")}
+        import opensearchpy as es_pkg
+        result["package"] = {"installed": True, "version": getattr(es_pkg, "__versionstr__", "unknown")}
     except ImportError:
         result["package"] = {"installed": False, "version": None}
         return ApiResponse(data=result)
@@ -876,12 +876,15 @@ async def diagnose_es(
     # 3. Try to create client and list indices
     client = None
     try:
-        from elasticsearch import AsyncElasticsearch
+        from opensearchpy import AsyncOpenSearch
         if parsed:
-            host = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 443}"
-            auth = (parsed.username, parsed.password) if parsed.username else None
-            client = AsyncElasticsearch(hosts=[host], basic_auth=auth, verify_certs=False)
-            client._verified_elasticsearch = True  # Bonsai doesn't send X-Elastic-Product header
+            client = AsyncOpenSearch(
+                hosts=[{"host": parsed.hostname, "port": parsed.port or 443}],
+                http_auth=(parsed.username, parsed.password) if parsed.username else None,
+                use_ssl=(parsed.scheme == "https"),
+                verify_certs=False,
+                ssl_show_warn=False,
+            )
             info = await client.info()
             result["cluster"] = {
                 "connected": True,
@@ -898,16 +901,16 @@ async def diagnose_es(
             # Test write: index a small doc
             test_index = "_es_diagnose_test"
             try:
-                await client.index(index=test_index, id="test_1", document={"test": True, "ts": "now"})
+                await client.index(index=test_index, id="test_1", body={"test": True, "ts": "now"})
                 await client.indices.refresh(index=test_index)
-                search_resp = await client.search(index=test_index, query={"match_all": {}})
+                search_resp = await client.search(index=test_index, body={"query": {"match_all": {}}})
                 hits = search_resp.get("hits", {}).get("hits", [])
                 result["test_write"] = {"success": True, "hits_returned": len(hits)}
             except Exception as e:
                 result["test_write"] = {"success": False, "error": type(e).__name__, "detail": str(e)[:300]}
             finally:
                 try:
-                    await client.indices.delete(index=test_index, ignore_status=[404])
+                    await client.indices.delete(index=test_index, ignore=[404])
                 except Exception:
                     pass
 
