@@ -52,11 +52,18 @@ class ElasticsearchStore:
 
             # ES 8.x: use basic_auth (tuple) instead of deprecated http_auth
             auth = (parsed.username, parsed.password) if parsed.username else None
+
+            # Bonsai (and many hosted ES providers) don't return the
+            # `X-Elastic-Product: Elasticsearch` header that elasticsearch-py
+            # v8/v9 requires on every 2XX response.  Pre-set the flag so the
+            # first request doesn't raise UnsupportedProductError.
             self._client = AsyncElasticsearch(
                 hosts=[host],
                 basic_auth=auth,
                 verify_certs=False,
             )
+            self._client._verified_elasticsearch = True
+            logger.info("ES client created", host=parsed.hostname, port=parsed.port or 443)
             logger.info("ES client created", host=parsed.hostname, port=parsed.port or 443)
         except Exception as exc:
             self._available = False

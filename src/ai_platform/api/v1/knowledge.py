@@ -881,6 +881,7 @@ async def diagnose_es(
             host = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 443}"
             auth = (parsed.username, parsed.password) if parsed.username else None
             client = AsyncElasticsearch(hosts=[host], basic_auth=auth, verify_certs=False)
+            client._verified_elasticsearch = True  # Bonsai doesn't send X-Elastic-Product header
             info = await client.info()
             result["cluster"] = {
                 "connected": True,
