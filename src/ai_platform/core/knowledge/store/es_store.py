@@ -79,9 +79,15 @@ class ElasticsearchStore:
             exists = await client.indices.exists(index=self._index_name)
             logger.info("ES indices.exists result", index=self._index_name, exists=exists)
             if not exists:
+                # OpenSearch uses knn_vector (not dense_vector like Elasticsearch)
                 await client.indices.create(
                     index=self._index_name,
                     body={
+                        "settings": {
+                            "index": {
+                                "knn": True,
+                            }
+                        },
                         "mappings": {
                             "properties": {
                                 "content": {"type": "text", "analyzer": "standard"},
@@ -91,12 +97,16 @@ class ElasticsearchStore:
                                 "chunk_index": {"type": "integer"},
                                 "filename": {"type": "keyword"},
                                 "embedding": {
-                                    "type": "dense_vector",
-                                    "dims": dim,
-                                    "similarity": "cosine",
+                                    "type": "knn_vector",
+                                    "dimension": dim,
+                                    "method": {
+                                        "name": "hnsw",
+                                        "space_type": "cosinesimil",
+                                        "engine": "nmslib",
+                                    },
                                 },
                             }
-                        }
+                        },
                     },
                 )
                 logger.info("ES index CREATED", index=self._index_name, dim=dim)
