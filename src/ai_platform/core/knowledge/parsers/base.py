@@ -76,20 +76,23 @@ async def parse_document(content: bytes, mime_type: str) -> str:
 
 
 async def _parse_pdf(content: bytes) -> str:
-    """Parse PDF using pymupdf4llm."""
+    """Parse PDF using pymupdf4llm, falling back to PyMuPDF."""
     try:
         import pymupdf4llm
 
         text = pymupdf4llm.to_markdown(content)
         return text
     except ImportError:
-        # Fallback to PyMuPDF directly
-        import fitz
+        pass
+    except Exception as exc:
+        logger.warning("pymupdf4llm failed, falling back to fitz", error=str(exc))
 
-        doc = fitz.open(stream=content, filetype="pdf")
-        text = "\n\n".join(page.get_text() for page in doc)
-        doc.close()
-        return text
+    import fitz
+
+    doc = fitz.open(stream=content, filetype="pdf")
+    text = "\n\n".join(page.get_text() for page in doc)
+    doc.close()
+    return text
 
 
 async def _parse_html(content: bytes) -> str:

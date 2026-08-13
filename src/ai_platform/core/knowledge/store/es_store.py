@@ -5,8 +5,6 @@ from __future__ import annotations
 import structlog
 from urllib.parse import urlparse
 
-from elasticsearch import AsyncElasticsearch
-
 from ai_platform.config import get_settings
 
 logger = structlog.get_logger()
@@ -21,12 +19,19 @@ class ElasticsearchStore:
 
     def __init__(self, index_name: str) -> None:
         self._index_name = index_name
-        self._client: AsyncElasticsearch | None = None
+        self._client: object | None = None
         self._available = True
 
-    def _get_client(self) -> AsyncElasticsearch | None:
+    def _get_client(self):  # -> AsyncElasticsearch | None:
+        """Lazy-init AsyncElasticsearch client with graceful degradation."""
         if self._client is not None:
             return self._client
+        try:
+            from elasticsearch import AsyncElasticsearch
+        except ImportError:
+            self._available = False
+            logger.warning("elasticsearch package not installed, disabling ES")
+            return None
         settings = get_settings()
         es_url = settings.elasticsearch_url
         if not es_url:
