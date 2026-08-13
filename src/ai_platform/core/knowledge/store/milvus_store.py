@@ -203,4 +203,11 @@ async def get_milvus_store(collection_name: str, embedding_model: str, dim: int 
     """Get or create a MilvusStore instance (cached by collection name)."""
     if collection_name not in _store_cache:
         _store_cache[collection_name] = MilvusStore(collection_name, embedding_model, dim=dim)
+    elif dim is not None:
+        # Update the cached store's dimension if a caller (e.g. ingestion)
+        # supplies one after an earlier caller (e.g. query) created the
+        # store without knowing the correct dimension.
+        store = _store_cache[collection_name]
+        if store._dim is None:
+            store._dim = dim
     return _store_cache[collection_name]
