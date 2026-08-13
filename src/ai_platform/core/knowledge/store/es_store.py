@@ -43,7 +43,7 @@ class ElasticsearchStore:
             self._client = AsyncElasticsearch(
                 hosts=[f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 443}"],
                 http_auth=(parsed.username, parsed.password) if parsed.username else None,
-                verify_certs=False,
+                verify_certs=True,
             )
             logger.info(
                 "ES client created",
