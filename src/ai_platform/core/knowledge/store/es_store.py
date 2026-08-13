@@ -34,9 +34,10 @@ class ElasticsearchStore:
             return None
         settings = get_settings()
         es_url = settings.elasticsearch_url
+        logger.info("ES config read", url=es_url[:50] + "..." if len(es_url) > 50 else es_url)
         if not es_url or es_url == "http://localhost:9200":
             self._available = False
-            logger.warning("ES URL not configured (or still default), disabling ES")
+            logger.warning("ES URL not configured (or still default), disabling ES", raw_url=es_url[:80])
             return None
         try:
             parsed = urlparse(es_url)
