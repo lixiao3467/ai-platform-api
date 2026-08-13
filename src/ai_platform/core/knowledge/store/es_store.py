@@ -34,18 +34,25 @@ class ElasticsearchStore:
             return None
         settings = get_settings()
         es_url = settings.elasticsearch_url
-        if not es_url:
+        if not es_url or es_url == "http://localhost:9200":
             self._available = False
+            logger.warning("ES URL not configured (or still default), disabling ES")
             return None
         try:
             parsed = urlparse(es_url)
             self._client = AsyncElasticsearch(
                 hosts=[f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 443}"],
                 http_auth=(parsed.username, parsed.password) if parsed.username else None,
-                verify_certs=True,
+                verify_certs=False,
             )
-        except Exception:
+            logger.info(
+                "ES client created",
+                host=parsed.hostname,
+                port=parsed.port or 443,
+            )
+        except Exception as exc:
             self._available = False
+            logger.warning("ES client creation failed", error=str(exc))
             return None
         return self._client
 
