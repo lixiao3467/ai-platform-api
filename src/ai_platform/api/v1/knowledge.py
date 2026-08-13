@@ -898,9 +898,22 @@ async def diagnose_es(
             kb_count = await db.scalar(select(func.count()).select_from(KnowledgeBase))
             result["kb_count"] = kb_count or 0
 
-            # Test write: index a small doc
+            # Test write: create index first (Bonsai restricts auto_create_index)
             test_index = "_es_diagnose_test"
             try:
+                # Explicitly create index — Bonsai doesn't allow auto-create
+                await client.indices.create(
+                    index=test_index,
+                    body={
+                        "mappings": {
+                            "properties": {
+                                "test": {"type": "boolean"},
+                                "ts": {"type": "keyword"},
+                            }
+                        }
+                    },
+                    ignore=400,  # ignore if already exists
+                )
                 await client.index(index=test_index, id="test_1", body={"test": True, "ts": "now"})
                 await client.indices.refresh(index=test_index)
                 search_resp = await client.search(index=test_index, body={"query": {"match_all": {}}})
