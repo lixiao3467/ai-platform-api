@@ -899,9 +899,10 @@ async def diagnose_es(
             result["kb_count"] = kb_count or 0
 
             # Test write: create index first (Bonsai restricts auto_create_index)
-            test_index = "_es_diagnose_test"
+            # Index name must match Bonsai's allowed patterns: *events*
+            test_index = "events_diagnose_test"
             try:
-                # Explicitly create index — Bonsai doesn't allow auto-create
+                # Explicitly create index — Bonsai doesn't allow auto-create for non-matching names
                 await client.indices.create(
                     index=test_index,
                     body={

@@ -193,8 +193,13 @@ class ElasticsearchStore:
 
 
 async def get_es_store(kb_id: str) -> ElasticsearchStore | None:
-    """Get or create a cached ElasticsearchStore instance for a knowledge base."""
-    index_name = f"kb_{kb_id.replace('-', '_')}"
+    """Get or create a cached ElasticsearchStore instance for a knowledge base.
+
+    Index name must match Bonsai's auto_create_index patterns:
+    [*logstash*,*requests*,*events*,*.kibana*,*kibana-int*,*filebeat*]
+    We use 'events_kb_' prefix to match '*events*'.
+    """
+    index_name = f"events_kb_{kb_id.replace('-', '_')}"
     if index_name not in _store_cache:
         _store_cache[index_name] = ElasticsearchStore(index_name)
     return _store_cache[index_name]
