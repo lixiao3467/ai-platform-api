@@ -71,11 +71,13 @@ class ElasticsearchStore:
 
     async def ensure_index(self, dim: int = 1536) -> None:
         client = self._get_client()
+        logger.info("ES ensure_index called", index=self._index_name, dim=dim, has_client=client is not None, available=self._available)
         if not client:
             logger.warning("ES ensure_index skipped: no client", index=self._index_name)
             return
         try:
             exists = await client.indices.exists(index=self._index_name)
+            logger.info("ES indices.exists result", index=self._index_name, exists=exists)
             if not exists:
                 await client.indices.create(
                     index=self._index_name,
@@ -117,6 +119,7 @@ class ElasticsearchStore:
         metadata: dict,
     ) -> None:
         client = self._get_client()
+        logger.info("ES index_chunk called", chunk_id=chunk_id, has_client=client is not None, available=self._available)
         if not client:
             logger.warning("ES index_chunk skipped: no client", chunk_id=chunk_id)
             return
@@ -131,6 +134,7 @@ class ElasticsearchStore:
                     **metadata,
                 },
             )
+            logger.info("ES index_chunk success", chunk_id=chunk_id)
         except Exception as e:
             logger.error(
                 "ES index_chunk FAILED",
