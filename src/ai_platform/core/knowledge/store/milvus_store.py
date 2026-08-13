@@ -53,12 +53,19 @@ class MilvusStore:
                 # we don't get a dimension-mismatch error on insert.
                 desc = await asyncio.to_thread(self._client.describe_collection, self._collection_name)
                 for field in desc.get("fields", []):
-                    if field.get("field_name") == "embedding":
-                        existing_dim = None
-                        for p in field.get("params", []):
-                            if p.get("key") == "dim":
-                                existing_dim = int(p["value"])
-                                break
+                    if field.get("name") == "embedding":
+                        field_params = field.get("params", {})
+                        # pymilvus may return params as a dict or a list of {key,value} dicts
+                        if isinstance(field_params, dict):
+                            existing_dim = field_params.get("dim")
+                        else:
+                            existing_dim = None
+                            for p in field_params:
+                                if p.get("key") == "dim":
+                                    existing_dim = p.get("value")
+                                    break
+                        if existing_dim is not None:
+                            existing_dim = int(existing_dim)
                         if existing_dim and existing_dim != self._dim:
                             await asyncio.to_thread(self._client.drop_collection, self._collection_name)
                             has = False
