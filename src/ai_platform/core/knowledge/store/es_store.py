@@ -43,7 +43,7 @@ class ElasticsearchStore:
             self._client = AsyncElasticsearch(
                 hosts=[f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 443}"],
                 http_auth=(parsed.username, parsed.password) if parsed.username else None,
-                verify_certs=True,
+                verify_certs=False,
             )
             logger.info(
                 "ES client created",
@@ -62,6 +62,7 @@ class ElasticsearchStore:
     async def ensure_index(self, dim: int = 1536) -> None:
         client = self._get_client()
         if not client:
+            logger.warning("ES ensure_index skipped: no client")
             return
         try:
             exists = await client.indices.exists(index=self._index_name)
@@ -87,6 +88,8 @@ class ElasticsearchStore:
                     },
                 )
                 logger.info("ES index created", index=self._index_name)
+            else:
+                logger.info("ES index already exists", index=self._index_name)
         except Exception as e:
             self._available = False
             logger.warning("ES ensure_index failed", index=self._index_name, error=str(e))
